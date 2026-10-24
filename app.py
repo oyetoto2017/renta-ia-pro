@@ -15,7 +15,6 @@ from openpyxl.styles import Font, PatternFill
 import pypdf
 import streamlit as st
 from docx import Document
-from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
@@ -23,6 +22,7 @@ from google.genai.errors import APIError
 try:
     from pdf2image import convert_from_bytes
     import pytesseract
+    from PIL import Image
     OCR_DISPONIBLE = True
 except Exception:
     OCR_DISPONIBLE = False
@@ -89,7 +89,7 @@ def calcular_dv(nit_str: str) -> str:
 
 
 # ==============================================================================
-# 2. SEGURIDAD Y CONEXIÓN COMPATIBLE CON CLAVES 'AIza...' Y 'AQ....'
+# 2. SEGURIDAD Y CONEXIÓN GEMINI INTELIGENTE ('AIza...' + 'AQ....' SIN BLOQUEOS)
 # ==============================================================================
 def limpiar_key(raw: str) -> str:
     """Acepta claves estándar de Google AI Studio (AIza...) y claves Vertex Express (AQ....)."""
@@ -144,23 +144,30 @@ def verificar_acceso() -> bool:
     return False
 
 
-def crear_clientes_gemini(llave: str) -> List[Any]:
-    """Construye el cliente adecuado según el formato de la clave (AQ. Vertex Express vs AIza AI Studio)."""
+def crear_clientes_gemini(llave: str) -> List[Tuple[str, Any]]:
+    """Construye los clientes compatibles sin abortar antes de probar alternativas."""
+    clientes = []
     if llave.startswith("AQ."):
-        clientes = []
         try:
-            clientes.append(genai.Client(vertexai=True, api_key=llave))
+            clientes.append(("VertexAI", genai.Client(vertexai=True, api_key=llave)))
         except Exception:
             pass
         try:
-            clientes.append(genai.Client(api_key=llave))
+            clientes.append(("AIStudio", genai.Client(api_key=llave)))
         except Exception:
             pass
-        return clientes
-    return [genai.Client(api_key=llave)]
+    else:
+        clientes.append(("AIStudio", genai.Client(api_key=llave)))
+    return clientes
 
 
-def llamar_gemini(api_key: str, contents: Any, config: types.GenerateContentConfig) -> str:
+def llamar_gemini(
+    api_key: str,
+    contents: Any,
+    system_instruction: str = None,
+    temperatura: float = 0.0,
+) -> str:
+    """Consulta Gemini con modelos 2026 vigentes, detección de cuota agotada y fallback real entre clientes."""
     llave = limpiar_key(api_key)
     if not llave:
         raise ValueError(
@@ -168,36 +175,85 @@ def llamar_gemini(api_key: str, contents: Any, config: types.GenerateContentConf
         )
 
     clientes = crear_clientes_gemini(llave)
-    ultimo_err = None
+    if not clientes:
+        raise RuntimeError("No se pudo inicializar el cliente de Gemini. Revisa la clave configurada.")
 
-    for cli in clientes:
-        for mod in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+    cfg_kwargs: Dict[str, Any] = {"temperature": temperatura}
+    if system_instruction:
+        cfg_kwargs["system_instruction"] = system_instruction
+    config = types.GenerateContentConfig(**cfg_kwargs)
+
+    modelos = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+    ultimo_err = None
+    errores_modelos = []
+
+    for nombre_cli, cli in clientes:
+        abortar_este_cliente = False
+        for mod in modelos:
+            if abortar_este_cliente:
+                break
             for intento in range(3):
                 try:
-                    return cli.models.generate_content(model=mod, contents=contents, config=config).text
+                    respuesta = cli.models.generate_content(model=mod, contents=contents, config=config)
+                    texto = getattr(respuesta, "text", None)
+                    if not texto or not str(texto).strip():
+                        raise RuntimeError(f"Gemini devolvió respuesta vacía en {mod}.")
+                    return str(texto)
                 except APIError as e:
                     ultimo_err = e
-                    cod = getattr(e, "code", None)
-                    if cod == 429 and intento < 2:
-                        time.sleep(4 * (intento + 1))
-                        continue
-                    if cod in (400, 401, 403):
+                    codigo = getattr(e, "code", None) or getattr(e, "status_code", None)
+                    detalle = str(e).lower()
+
+                    if codigo == 429:
+                        indicadores_cuota = (
+                            "quota_exceeded", "daily limit", "limit: 0", "billing", "generaterequestsperday"
+                        )
+                        if any(p in detalle for p in indicadores_cuota):
+                            raise RuntimeError(
+                                "CUOTA_GEMINI_AGOTADA: Google reporta cuota diaria/proyecto agotada. "
+                                "Usa el botón 'Extraer SIN IA' o espera a que se restablezca la cuota."
+                            ) from e
+                        if intento < 2:
+                            time.sleep((3, 6)[intento])
+                            continue
+                        errores_modelos.append(f"{nombre_cli}/{mod}: HTTP 429 (límite por minuto)")
                         break
+
+                    if codigo in (401, 403):
+                        errores_modelos.append(f"{nombre_cli}/{mod}: HTTP {codigo} (permisos/autenticación)")
+                        abortar_este_cliente = True
+                        break
+
+                    if codigo == 400:
+                        errores_modelos.append(f"{nombre_cli}/{mod}: HTTP 400 ({str(e)[:120]})")
+                        break
+
+                    if codigo == 404:
+                        errores_modelos.append(f"{nombre_cli}/{mod}: HTTP 404 (modelo no disponible)")
+                        break
+
+                    if codigo is not None and codigo >= 500 and intento < 2:
+                        time.sleep(2 * (intento + 1))
+                        continue
+
+                    errores_modelos.append(f"{nombre_cli}/{mod}: HTTP {codigo} ({str(e)[:120]})")
                     break
+                except (TimeoutError, ConnectionError) as e:
+                    ultimo_err = e
+                    if intento < 2:
+                        time.sleep(2 * (intento + 1))
+                        continue
+                    errores_modelos.append(f"{nombre_cli}/{mod}: error de red ({e})")
+                    break
+                except RuntimeError:
+                    raise
                 except Exception as e:
                     ultimo_err = e
+                    errores_modelos.append(f"{nombre_cli}/{mod}: {type(e).__name__}: {str(e)[:120]}")
                     break
 
-    cod_final = getattr(ultimo_err, "code", None)
-    if cod_final in (400, 401, 403):
-        if llave.startswith("AQ."):
-            raise ValueError(
-                f"Google rechazó o expiró la clave 'AQ....' (Código {cod_final}). "
-                "Genera una clave gratuita permanente 'AIzaSy...' en https://aistudio.google.com/apikey y guárdala en Secrets."
-            )
-        raise ValueError(f"Google rechazó la API Key (Código {cod_final}). Verifica tu clave en Google AI Studio.")
-
-    raise RuntimeError(f"Límite temporal de consultas IA alcanzado. Espera 20 segundos e intenta de nuevo ({type(ultimo_err).__name__}).")
+    resumen_err = " | ".join(errores_modelos) or str(ultimo_err)
+    raise RuntimeError(f"No se pudo completar la consulta a Gemini. Detalle técnico: {resumen_err}") from ultimo_err
 
 
 # ==============================================================================
@@ -406,25 +462,15 @@ def liquidar_210(d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, 
 
 
 # ==============================================================================
-# 4. LECTORES INTELIGENTES: EXÓGENA DIAN + PILA MULTI-PDF + CERTIFICADOS IA
+# 4. LECTORES CON CACHÉ SHA-256 + LOTE 1 CONSULTA + RESPALDO LOCAL PDF/OCR
 # ==============================================================================
-class SoporteIA(BaseModel):
-    tipo_documento: str = Field(description="Certificado 220, CDT, Extracto, Predial, Prepagada")
-    entidad: str = Field(description="Entidad emisora")
-    efectivo_bancos_dic31: float = Field(default=0.0)
-    valor_inmueble_o_cdt_dic31: float = Field(default=0.0)
-    saldo_deuda_dic31: float = Field(default=0.0)
-    ingresos_brutos_trabajo: float = Field(default=0.0)
-    cesantias_exentas: float = Field(default=0.0)
-    ingresos_brutos_honorarios: float = Field(default=0.0)
-    salud_pension_obligatoria: float = Field(default=0.0)
-    ingresos_capital_cdt: float = Field(default=0.0)
-    componente_inflacionario_cdt: float = Field(default=0.0)
-    intereses_vivienda: float = Field(default=0.0)
-    medicina_prepagada: float = Field(default=0.0)
-    gmf_4x1000_certificado: float = Field(default=0.0)
-    aportes_afc_fpv: float = Field(default=0.0)
-    retenciones_practicadas: float = Field(default=0.0)
+CAMPOS_SOPORTE = [
+    "efectivo_bancos_dic31", "valor_inmueble_o_cdt_dic31", "saldo_deuda_dic31",
+    "ingresos_brutos_trabajo", "cesantias_exentas", "ingresos_brutos_honorarios",
+    "salud_pension_obligatoria", "ingresos_capital_cdt", "componente_inflacionario_cdt",
+    "intereses_vivienda", "medicina_prepagada", "gmf_4x1000_certificado",
+    "aportes_afc_fpv", "retenciones_practicadas",
+]
 
 
 def _nvl(val) -> float:
@@ -440,17 +486,185 @@ def _nvl(val) -> float:
 
 
 def _cop_txt(s: str) -> float:
-    s = str(s).strip().replace("$", "").replace(" ", "")
+    s = str(s).strip().replace("$", "").replace("COP", "").replace(" ", "")
     if not s:
         return 0.0
-    if re.match(r"^\d{1,3}(\.\d{3})+(,\d+)?$", s):
+    if re.match(r"^-?\d{1,3}(\.\d{3})+(,\d+)?$", s):
         s = s.replace(".", "").replace(",", ".")
+    elif re.match(r"^-?\d{1,3}(,\d{3})+(\.\d+)?$", s):
+        s = s.replace(",", "")
+    elif re.match(r"^-?\d+,\d{1,2}$", s):
+        s = s.replace(",", ".")
     else:
         s = s.replace(",", "")
     try:
         return float(s)
     except Exception:
         return 0.0
+
+
+def validar_archivo_soporte(nombre: str, b: bytes, mime: str) -> None:
+    if not b:
+        raise ValueError(f"El archivo '{nombre}' está vacío.")
+    mime_permitidos = {"application/pdf", "image/png", "image/jpeg", "image/jpg"}
+    if mime not in mime_permitidos:
+        raise ValueError(f"Tipo de archivo no admitido en '{nombre}': {mime or 'desconocido'}.")
+    if len(b) > 20 * 1024 * 1024:
+        raise ValueError(f"El archivo '{nombre}' supera los 20 MB permitidos.")
+
+
+def extraer_texto_hibrido(b: bytes, mime: str) -> str:
+    """Extrae texto nativo del PDF o aplica OCR local si es escaneado/imagen (evita enviar binarios pesados)."""
+    if mime == "application/pdf":
+        try:
+            lector = pypdf.PdfReader(io.BytesIO(b))
+            txt = "\n".join((p.extract_text() or "") for p in lector.pages[:4]).strip()
+            if len(txt) >= 35:
+                return txt
+        except Exception:
+            pass
+        if OCR_DISPONIBLE:
+            try:
+                imgs = convert_from_bytes(b, first_page=1, last_page=2, dpi=150)
+                return "\n".join(pytesseract.image_to_string(im, lang="spa") for im in imgs).strip()
+            except Exception:
+                pass
+    elif OCR_DISPONIBLE:
+        try:
+            im = Image.open(io.BytesIO(b))
+            return pytesseract.image_to_string(im, lang="spa").strip()
+        except Exception:
+            pass
+    return ""
+
+
+def parsear_json_soportes(texto_raw: str) -> List[dict]:
+    """Limpia bloques markdown y normaliza null/vacíos a 0.0 para evitar errores numéricos."""
+    limpio = (texto_raw or "").strip()
+    limpio = re.sub(r"^```(?:json)?\s*", "", limpio, flags=re.IGNORECASE)
+    limpio = re.sub(r"\s*```$", "", limpio)
+    try:
+        data = json.loads(limpio)
+    except Exception:
+        m = re.search(r"(\{.*\}|\[.*\])", limpio, flags=re.DOTALL)
+        if not m:
+            raise ValueError(f"Respuesta IA sin JSON válido: {limpio[:140]}")
+        data = json.loads(m.group(1))
+
+    lista = data.get("documentos", [data]) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+    salida = []
+    for item in lista:
+        if not isinstance(item, dict):
+            continue
+        reg = {
+            "archivo": str(item.get("archivo") or "Soporte"),
+            "tipo_documento": str(item.get("tipo_documento") or "Certificado"),
+            "entidad": str(item.get("entidad") or "Entidad"),
+        }
+        for c in CAMPOS_SOPORTE:
+            reg[c] = _nvl(item.get(c, 0.0))
+        salida.append(reg)
+    return salida
+
+
+def extraer_soporte_nativo_sin_ia(nombre: str, b: bytes, mime: str) -> dict:
+    """Extractor local instantáneo (PDF + OCR) 100% libre de cuotas de IA."""
+    texto = extraer_texto_hibrido(b, mime)
+    t_clean = re.sub(r"[ \t]+", " ", texto or "")
+    lineas = [l.strip() for l in t_clean.splitlines() if l.strip()]
+    tl = t_clean.lower().replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
+
+    entidad = "Entidad Detectada"
+    for k_b, nom_b in [
+        ("bbva", "BBVA Colombia"), ("bilbao vizcaya", "BBVA Colombia"),
+        ("bancolombia", "Bancolombia"), ("davivienda", "Davivienda"),
+        ("bogota", "Banco de Bogotá"), ("nequi", "Nequi"), ("daviplata", "Daviplata"),
+        ("colpatria", "Scotiabank Colpatria"), ("occidente", "Banco de Occidente"),
+        ("popular", "Banco Popular"), ("av villas", "Banco AV Villas"),
+    ]:
+        if k_b in tl:
+            entidad = nom_b
+            break
+
+    es_220 = "220" in tl and ("ingresos y retenciones" in tl or "pagos laborales" in tl)
+    es_cdt = "cdt" in tl or "deposito a termino" in tl
+    es_predial = "predial" in tl or "avaluo catastral" in tl
+
+    res = {
+        "archivo": nombre,
+        "tipo_documento": "Formulario 220" if es_220 else ("Certificado CDT" if es_cdt else ("Predial" if es_predial else "Certificado Tributario")),
+        "entidad": entidad,
+    }
+    for c in CAMPOS_SOPORTE:
+        res[c] = 0.0
+
+    pat_m = r"\$\s*-?\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\b\d{1,3}(?:\.\d{3})+(?:,\d{1,2})?\b|\b\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?\b"
+    for l in lineas:
+        ll = l.lower().replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
+        montos = [m for m in (_cop_txt(x) for x in re.findall(pat_m, l)) if 0 <= abs(m) <= 50_000_000_000]
+        if not montos:
+            continue
+        if any(k in ll for k in ["retencion en la fuente", "retencion practicada", "retefuente", "valor retenido", "total retenciones"]):
+            res["retenciones_practicadas"] = max(res["retenciones_practicadas"], montos[-1])
+        elif any(k in ll for k in ["gravamen a los movimientos", "gmf", "4 x 1000", "4x1000", "cuatro por mil"]):
+            res["gmf_4x1000_certificado"] = max(res["gmf_4x1000_certificado"], montos[-1])
+        elif any(k in ll for k in ["rendimientos financieros", "intereses pagados", "rendimientos pagados", "intereses abonados", "total rendimientos"]):
+            res["ingresos_capital_cdt"] = max(res["ingresos_capital_cdt"], montos[-1])
+        elif ("componente inflacionario" in ll or "parte no gravada" in ll) and ("$" in l or "%" not in l):
+            res["componente_inflacionario_cdt"] = max(res["componente_inflacionario_cdt"], montos[-1])
+        elif any(k in ll for k in ["saldo a 31 de diciembre", "saldo al 31 de diciembre", "saldo dic 31", "saldo a dic", "saldo capital a 31"]):
+            if es_cdt or "cdt" in ll:
+                res["valor_inmueble_o_cdt_dic31"] = max(res["valor_inmueble_o_cdt_dic31"], montos[-1])
+            elif any(w in ll for w in ["deuda", "hipotec", "obligacion", "tarjeta"]):
+                res["saldo_deuda_dic31"] = max(res["saldo_deuda_dic31"], abs(montos[-1]))
+            else:
+                res["efectivo_bancos_dic31"] = max(res["efectivo_bancos_dic31"], montos[-1])
+        elif "avaluo catastral" in ll or "avaluo vigencia" in ll:
+            res["valor_inmueble_o_cdt_dic31"] = max(res["valor_inmueble_o_cdt_dic31"], montos[-1])
+        elif ("honorarios" in ll or "servicios" in ll) and "retencion" not in ll:
+            res["ingresos_brutos_honorarios"] = max(res["ingresos_brutos_honorarios"], montos[-1])
+
+    return res
+
+
+def extraer_pendientes_con_ia(api_key: str, pendientes: List[Tuple[Any, bytes, str]]) -> List[dict]:
+    """Envía solo los certificados nuevos en 1 SOLA consulta ligera (compatible con Vertex 'AQ.' y 'AIza')."""
+    bloques_texto = []
+    partes_visuales: List[Any] = []
+
+    for fc, b, _ in pendientes:
+        validar_archivo_soporte(fc.name, b, fc.type)
+        txt = extraer_texto_hibrido(b, fc.type)
+        if len(txt) >= 30:
+            bloques_texto.append(f"=== ARCHIVO_ID: {fc.name} ===\n{txt[:9500]}")
+        else:
+            partes_visuales.append(types.Part.from_text(text=f"=== ARCHIVO_ID: {fc.name} ==="))
+            partes_visuales.append(types.Part.from_bytes(data=b, mime_type=fc.type))
+
+    instruccion = (
+        "Actúa como extractor de datos tributarios DIAN Colombia (no inventes valores). "
+        f"Debes devolver exactamente {len(pendientes)} elemento(s) en la lista 'documentos', uno por cada ARCHIVO_ID, "
+        "usando el nombre exacto de cada archivo en el campo 'archivo'. Responde SOLO con JSON válido así:\n"
+        '{"documentos": [{"archivo": "nombre.pdf", "tipo_documento": "CDT / Retefuente / Saldo / 220", '
+        '"entidad": "Entidad", "efectivo_bancos_dic31": 0, "valor_inmueble_o_cdt_dic31": 0, '
+        '"saldo_deuda_dic31": 0, "ingresos_brutos_trabajo": 0, "cesantias_exentas": 0, '
+        '"ingresos_brutos_honorarios": 0, "salud_pension_obligatoria": 0, "ingresos_capital_cdt": 0, '
+        '"componente_inflacionario_cdt": 0, "intereses_vivienda": 0, "medicina_prepagada": 0, '
+        '"gmf_4x1000_certificado": 0, "aportes_afc_fpv": 0, "retenciones_practicadas": 0}]}\n'
+        "Usa 0 en cualquier campo que no aparezca. Si un CDT venció y su saldo al 31 de diciembre es $0, "
+        "registra 0 en 'valor_inmueble_o_cdt_dic31' y extrae intereses pagados, componente inflacionario y retención."
+    )
+
+    if not partes_visuales:
+        prompt_final = "\n\n".join(bloques_texto) + "\n\n" + instruccion
+        resp_txt = llamar_gemini(api_key, prompt_final, temperatura=0.0)
+    else:
+        if bloques_texto:
+            partes_visuales.append(types.Part.from_text(text="\n\n".join(bloques_texto)))
+        partes_visuales.append(types.Part.from_text(text=instruccion))
+        resp_txt = llamar_gemini(api_key, partes_visuales, temperatura=0.0)
+
+    return parsear_json_soportes(resp_txt)
 
 
 def leer_pila_pdf(nombre: str, b: bytes) -> dict:
@@ -635,26 +849,6 @@ def procesar_exogena(b: bytes, anio_ref: int) -> Tuple[pd.DataFrame, Dict[str, A
     return df_ter.reset_index(drop=True), res
 
 
-def extraer_soporte_ia(api_key: str, b: bytes, mime: str) -> dict:
-    partes = [types.Part.from_bytes(data=b, mime_type=mime)]
-    if mime == "application/pdf":
-        try:
-            txt_p = "\n".join((p.extract_text() or "") for p in pypdf.PdfReader(io.BytesIO(b)).pages[:3]).strip()
-            if txt_p:
-                partes.append(f"Texto digital PDF:\n{txt_p[:9000]}")
-            elif OCR_DISPONIBLE:
-                imgs = convert_from_bytes(b, first_page=1, last_page=2)
-                partes.append("\n".join(pytesseract.image_to_string(im, lang="spa") for im in imgs)[:7000])
-        except Exception:
-            pass
-    partes.append(
-        "Extrae en pesos colombianos (COP) las cifras tributarias exactas de este certificado DIAN/bancario. "
-        "Si es un CDT vencido con saldo $0 a dic 31, pon 0 en 'valor_inmueble_o_cdt_dic31' y extrae intereses, componente inflacionario y retención."
-    )
-    cfg = types.GenerateContentConfig(response_mime_type="application/json", response_schema=SoporteIA, temperature=0.0)
-    return json.loads(llamar_gemini(api_key, partes, cfg))
-
-
 # ==============================================================================
 # 5. EXPORTADORES EJECUTIVOS (.XLSX ESTILIZADO + .DOCX DICTAMEN)
 # ==============================================================================
@@ -759,7 +953,7 @@ def generar_word(r: dict, d: dict, anio: int, uvt: float) -> bytes:
 
 
 # ==============================================================================
-# 6. ESTADO DE SESIÓN BLINDADO (LOS ARCHIVOS NUNCA SE BORRAN AL PULSAR BOTONES)
+# 6. INTERFAZ PRINCIPAL BLINDADA (v5.4 FUSIÓN PRO)
 # ==============================================================================
 if not verificar_acceso():
     st.stop()
@@ -793,12 +987,13 @@ d = st.session_state.datos
 
 with st.sidebar:
     st.title("⚙️ Configuración DIAN")
-    st.caption("Versión **v5.1 Estable** • Multiaño")
+    st.caption("Versión **v5.4 Fusión Pro** • Caché SHA-256 + Lote IA + Respaldo Local")
 
     sec_key = obtener_secreto("GEMINI_API_KEY")
     if sec_key:
         api_key = sec_key
-        st.success(f"🔒 Gemini conectada en Secrets ({sec_key[:3]}...{sec_key[-4:]})")
+        modo_txt = "Vertex AI" if sec_key.startswith("AQ.") else "AI Studio"
+        st.success(f"🔒 Gemini conectada — {modo_txt} ({sec_key[:3]}...{sec_key[-4:]})")
     else:
         st.warning("⚠️ Sin clave en Secrets. Pégala abajo si vas a usar IA:")
         man_key = st.text_input("Pegar clave Gemini (AIza... o AQ....)", value="", placeholder="AIzaSy... o AQ....")
@@ -889,7 +1084,7 @@ t1, t2, t3, t4, t5 = st.tabs([
 ])
 
 # ==============================================================================
-# PASO 1: EXÓGENA PERSISTENTE + PILA PERSISTENTE + SOPORTES IA
+# PASO 1: EXÓGENA PERSISTENTE + PILA PERSISTENTE + SOPORTES CON CACHÉ SHA-256
 # ==============================================================================
 with t1:
     c_izq, c_der = st.columns(2)
@@ -958,7 +1153,7 @@ with t1:
                 try:
                     with st.spinner("Analizando terceros..."):
                         pr = f"Explica brevemente en español sencillo estos terceros de Exógena DIAN:\n{df_e.head(120).to_csv(index=False)}"
-                        st.session_state.auditoria_ia = llamar_gemini(api_key, pr, types.GenerateContentConfig(temperature=0.1))
+                        st.session_state.auditoria_ia = llamar_gemini(api_key, pr, temperatura=0.1)
                 except Exception as e:
                     st.error(f"⚠️ {e}")
 
@@ -1006,57 +1201,85 @@ with t1:
                 st.rerun()
 
         st.divider()
-        st.subheader("📄 C. Lector IA de Otros Certificados (220, CDT, Predial, Salud)")
+        st.subheader("📄 C. Lector de Otros Certificados (220, CDT, Predial, Salud)")
         f_certs = st.file_uploader("Sube PDFs o fotos de certificados", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True, key=f"cert_{rid}")
-        if f_certs and st.button(f"🔍 Extraer {len(f_certs)} soporte(s) con IA Gemini", use_container_width=True):
-            if not api_key:
-                st.error("🔑 Configura tu clave en Configuración -> Secrets o pégala arriba a la izquierda.")
-            else:
-                lista_c = []
-                barra = st.progress(0.0, text="Iniciando lectura inteligente de certificados...")
-                for idx_c, fc in enumerate(f_certs):
-                    try:
-                        barra.progress(idx_c / len(f_certs), text=f"Leyendo {fc.name} ({idx_c+1} de {len(f_certs)})...")
-                        it = extraer_soporte_ia(api_key, fc.getvalue(), fc.type)
-                        it["archivo"] = fc.name
-                        lista_c.append(it)
-                        if idx_c + 1 < len(f_certs):
-                            time.sleep(1.5)
-                    except Exception as e:
-                        st.error(f"Error en {fc.name}: {e}")
-                barra.empty()
-                st.session_state.mem_cert = lista_c
+        if f_certs:
+            bt_ia, bt_nat = st.columns(2)
+
+            if bt_ia.button(f"🤖 Extraer {len(f_certs)} con IA (Caché SHA-256)", type="primary", use_container_width=True):
+                if not api_key:
+                    st.error("🔑 Configura tu clave en Configuración -> Secrets o usa el botón de al lado 'Extraer SIN IA'.")
+                else:
+                    resultados = {it["_sha256"]: it for it in st.session_state.mem_cert if it.get("_sha256")}
+                    sin_huella = [it for it in st.session_state.mem_cert if not it.get("_sha256")]
+                    pendientes = []
+                    for arc in f_certs:
+                        cont = arc.getvalue()
+                        h_sha = hashlib.sha256(cont).hexdigest()
+                        if h_sha not in resultados:
+                            pendientes.append((arc, cont, h_sha))
+
+                    if not pendientes:
+                        st.info("✅ Estos certificados ya están extraídos en memoria (0 consultas nuevas a Gemini).")
+                    else:
+                        try:
+                            with st.spinner(f"Procesando {len(pendientes)} soporte(s) nuevo(s) en 1 sola llamada IA..."):
+                                lista_nuevos = extraer_pendientes_con_ia(api_key, pendientes)
+                                mapa_nombre = {it.get("archivo", ""): it for it in lista_nuevos}
+                                for idx_p, (arc, cont, h_sha) in enumerate(pendientes):
+                                    item_ok = mapa_nombre.get(arc.name) or (
+                                        lista_nuevos[idx_p] if idx_p < len(lista_nuevos) else extraer_soporte_nativo_sin_ia(arc.name, cont, arc.type)
+                                    )
+                                    item_ok["archivo"] = arc.name
+                                    item_ok["_sha256"] = h_sha
+                                    resultados[h_sha] = item_ok
+                        except Exception as e:
+                            st.warning(f"⚠️ Aviso IA ({e}). Extrayendo automáticamente con motor local PDF + OCR...")
+                            for arc, cont, h_sha in pendientes:
+                                item_loc = extraer_soporte_nativo_sin_ia(arc.name, cont, arc.type)
+                                item_loc["_sha256"] = h_sha
+                                resultados[h_sha] = item_loc
+
+                        st.session_state.mem_cert = sin_huella + list(resultados.values())
+
+            if bt_nat.button(f"⚡ Extraer {len(f_certs)} SIN IA (Local)", use_container_width=True):
+                with st.spinner("Extrayendo cifras localmente (PDF + OCR)..."):
+                    nuevos_loc = []
+                    for arc in f_certs:
+                        cont = arc.getvalue()
+                        it_l = extraer_soporte_nativo_sin_ia(arc.name, cont, arc.type)
+                        it_l["_sha256"] = hashlib.sha256(cont).hexdigest()
+                        nuevos_loc.append(it_l)
+                    st.session_state.mem_cert = nuevos_loc
 
         if st.session_state.mem_cert:
-            df_c = st.data_editor(pd.DataFrame(st.session_state.mem_cert), use_container_width=True, hide_index=True)
+            st.caption("Tabla editable de certificados extraídos (puedes corregir cualquier celda antes de aplicar):")
+            df_base = pd.DataFrame(st.session_state.mem_cert).drop(columns=["_sha256"], errors="ignore")
+            df_c = st.data_editor(df_base, use_container_width=True, hide_index=True, num_rows="dynamic")
             cc1, cc2 = st.columns(2)
+            mapeo_campos = [
+                ("efectivo_bancos_dic31", "efectivo"), ("valor_inmueble_o_cdt_dic31", "otros_activos"),
+                ("saldo_deuda_dic31", "deudas"), ("ingresos_brutos_trabajo", "ing_brutos_trabajo"),
+                ("cesantias_exentas", "cesantias_exentas"), ("ingresos_brutos_honorarios", "ing_brutos_honorarios"),
+                ("salud_pension_obligatoria", "salud_pension_trabajo"), ("ingresos_capital_cdt", "ing_brutos_capital"),
+                ("componente_inflacionario_cdt", "incrngo_capital"), ("intereses_vivienda", "intereses_vivienda"),
+                ("medicina_prepagada", "medicina_prepagada"), ("gmf_4x1000_certificado", "gmf_certificado_100"),
+                ("aportes_afc_fpv", "aportes_afc_fpv"), ("retenciones_practicadas", "retenciones_anio"),
+            ]
             if cc1.button("🔄 Reemplazar casillas con estos certificados", type="primary", use_container_width=True):
-                for campo_df, campo_d in [
-                    ("efectivo_bancos_dic31", "efectivo"), ("valor_inmueble_o_cdt_dic31", "otros_activos"),
-                    ("saldo_deuda_dic31", "deudas"), ("ingresos_brutos_trabajo", "ing_brutos_trabajo"),
-                    ("cesantias_exentas", "cesantias_exentas"), ("ingresos_brutos_honorarios", "ing_brutos_honorarios"),
-                    ("salud_pension_obligatoria", "salud_pension_trabajo"), ("ingresos_capital_cdt", "ing_brutos_capital"),
-                    ("componente_inflacionario_cdt", "incrngo_capital"), ("intereses_vivienda", "intereses_vivienda"),
-                    ("medicina_prepagada", "medicina_prepagada"), ("gmf_4x1000_certificado", "gmf_certificado_100"),
-                    ("aportes_afc_fpv", "aportes_afc_fpv"), ("retenciones_practicadas", "retenciones_anio"),
-                ]:
-                    if df_c[campo_df].sum() > 0:
-                        d[campo_d] = float(df_c[campo_df].sum())
+                for campo_df, campo_d in mapeo_campos:
+                    if campo_df in df_c.columns:
+                        suma_segura = float(df_c[campo_df].apply(_nvl).sum())
+                        if suma_segura > 0:
+                            d[campo_d] = suma_segura
                 st.session_state.mem_cert = []
                 st.session_state.toast_ok = "✅ Casillas actualizadas con tus certificados."
                 st.session_state.form_id += 1
                 st.rerun()
             if cc2.button("➕ Sumar a los valores actuales", use_container_width=True):
-                for campo_df, campo_d in [
-                    ("efectivo_bancos_dic31", "efectivo"), ("valor_inmueble_o_cdt_dic31", "otros_activos"),
-                    ("saldo_deuda_dic31", "deudas"), ("ingresos_brutos_trabajo", "ing_brutos_trabajo"),
-                    ("cesantias_exentas", "cesantias_exentas"), ("ingresos_brutos_honorarios", "ing_brutos_honorarios"),
-                    ("salud_pension_obligatoria", "salud_pension_trabajo"), ("ingresos_capital_cdt", "ing_brutos_capital"),
-                    ("componente_inflacionario_cdt", "incrngo_capital"), ("intereses_vivienda", "intereses_vivienda"),
-                    ("medicina_prepagada", "medicina_prepagada"), ("gmf_4x1000_certificado", "gmf_certificado_100"),
-                    ("aportes_afc_fpv", "aportes_afc_fpv"), ("retenciones_practicadas", "retenciones_anio"),
-                ]:
-                    d[campo_d] += float(df_c[campo_df].sum())
+                for campo_df, campo_d in mapeo_campos:
+                    if campo_df in df_c.columns:
+                        d[campo_d] += float(df_c[campo_df].apply(_nvl).sum())
                 st.session_state.mem_cert = []
                 st.session_state.toast_ok = "✅ Certificados sumados correctamente."
                 st.session_state.form_id += 1
@@ -1225,7 +1448,7 @@ with t5:
                 try:
                     with st.spinner("Analizando Estatuto Tributario..."):
                         sis = f"Eres Contador Tributarista Senior en Colombia. AG {anio_gravable}, UVT ${valor_uvt:,.0f}. Liquidación actual: {json.dumps(r, ensure_ascii=False)}."
-                        ans = llamar_gemini(api_key, preg, types.GenerateContentConfig(system_instruction=sis, temperature=0.2))
+                        ans = llamar_gemini(api_key, preg, system_instruction=sis, temperatura=0.2)
                         st.markdown(ans)
                         st.session_state.chat.append({"role": "assistant", "content": ans})
                 except Exception as e:
