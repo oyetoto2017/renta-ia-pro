@@ -11,7 +11,7 @@ from typing import Dict, Any, List, Tuple
 
 import pandas as pd
 import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.styles import Font, PatternFill
 import pypdf
 import streamlit as st
 from docx import Document
@@ -89,13 +89,20 @@ def calcular_dv(nit_str: str) -> str:
 
 
 # ==============================================================================
-# 2. SEGURIDAD Y CONEXIÓN GEMINI ANTIFALLOS
+# 2. SEGURIDAD Y CONEXIÓN COMPATIBLE CON CLAVES 'AIza...' Y 'AQ....'
 # ==============================================================================
 def limpiar_key(raw: str) -> str:
+    """Acepta claves estándar de Google AI Studio (AIza...) y claves Vertex Express (AQ....)."""
     if not raw:
         return ""
-    m = re.search(r"(AIza[0-9A-Za-z_\-]{25,})", str(raw).strip())
-    return m.group(1) if m else ""
+    txt = str(raw).strip()
+    m_aiza = re.search(r"(AIza[0-9A-Za-z_\-]{25,})", txt)
+    if m_aiza:
+        return m_aiza.group(1)
+    m_aq = re.search(r"(AQ\.[0-9A-Za-z_\-\.]{20,})", txt)
+    if m_aq:
+        return m_aq.group(1)
+    return ""
 
 
 def obtener_secreto(nombre: str) -> str:
@@ -137,31 +144,60 @@ def verificar_acceso() -> bool:
     return False
 
 
+def crear_clientes_gemini(llave: str) -> List[Any]:
+    """Construye el cliente adecuado según el formato de la clave (AQ. Vertex Express vs AIza AI Studio)."""
+    if llave.startswith("AQ."):
+        clientes = []
+        try:
+            clientes.append(genai.Client(vertexai=True, api_key=llave))
+        except Exception:
+            pass
+        try:
+            clientes.append(genai.Client(api_key=llave))
+        except Exception:
+            pass
+        return clientes
+    return [genai.Client(api_key=llave)]
+
+
 def llamar_gemini(api_key: str, contents: Any, config: types.GenerateContentConfig) -> str:
     llave = limpiar_key(api_key)
     if not llave:
         raise ValueError(
-            "Falta tu Gemini API Key ('AIza...'). Guárdala en Configuración -> Misterios (Secrets) como: GEMINI_API_KEY = \"AIza...\""
+            "Falta una clave válida de Gemini ('AIza...' o 'AQ....') en Configuración -> Secrets o en la barra lateral."
         )
-    client = genai.Client(api_key=llave)
+
+    clientes = crear_clientes_gemini(llave)
     ultimo_err = None
-    for mod in ["gemini-2.5-flash", "gemini-2.0-flash"]:
-        for intento in range(2):
-            try:
-                return client.models.generate_content(model=mod, contents=contents, config=config).text
-            except APIError as e:
-                ultimo_err = e
-                cod = getattr(e, "code", None)
-                if cod in (400, 401, 403):
-                    raise ValueError(f"Google rechazó la API Key (Código {cod}). Revisa tu clave en Google AI Studio.")
-                if cod == 429 and intento == 0:
-                    time.sleep(3)
-                    continue
-                break
-            except Exception as e:
-                ultimo_err = e
-                break
-    raise RuntimeError(f"Límite temporal de consultas IA alcanzado. Intenta en 20 segundos ({type(ultimo_err).__name__}).")
+
+    for cli in clientes:
+        for mod in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+            for intento in range(3):
+                try:
+                    return cli.models.generate_content(model=mod, contents=contents, config=config).text
+                except APIError as e:
+                    ultimo_err = e
+                    cod = getattr(e, "code", None)
+                    if cod == 429 and intento < 2:
+                        time.sleep(4 * (intento + 1))
+                        continue
+                    if cod in (400, 401, 403):
+                        break
+                    break
+                except Exception as e:
+                    ultimo_err = e
+                    break
+
+    cod_final = getattr(ultimo_err, "code", None)
+    if cod_final in (400, 401, 403):
+        if llave.startswith("AQ."):
+            raise ValueError(
+                f"Google rechazó o expiró la clave 'AQ....' (Código {cod_final}). "
+                "Genera una clave gratuita permanente 'AIzaSy...' en https://aistudio.google.com/apikey y guárdala en Secrets."
+            )
+        raise ValueError(f"Google rechazó la API Key (Código {cod_final}). Verifica tu clave en Google AI Studio.")
+
+    raise RuntimeError(f"Límite temporal de consultas IA alcanzado. Espera 20 segundos e intenta de nuevo ({type(ultimo_err).__name__}).")
 
 
 # ==============================================================================
@@ -234,14 +270,12 @@ def liquidar_210(d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, 
     lim_40 = redondear_dian(min(ing_netos_cg * 0.40, 1_340 * uvt))
     tope_790 = 790 * uvt
 
-    # Ruta A: 25% Renta Exenta (Casillas 32-36)
     c34_a = max(0, trab_bruto_tot - inc_trab_tot)
     c91_a = c34_a + c61 + c78
     ex25_a = redondear_dian(min(max(0, c34_a - ded_comunes) * 0.25, tope_790))
     acep_a = min(ded_comunes + ex25_a, lim_40, c91_a)
     rem_a = max(0, c91_a - acep_a)
 
-    # Ruta B: Honorarios con Costos + ARL (Casillas 43-46)
     cost_hon = redondear_dian(d["costos_honorarios"] + d["arl_honorarios"])
     c32_b = redondear_dian(d["ing_brutos_trabajo"])
     c33_b = min(c32_b, redondear_dian(d["salud_pension_trabajo"]))
@@ -759,18 +793,18 @@ d = st.session_state.datos
 
 with st.sidebar:
     st.title("⚙️ Configuración DIAN")
-    st.caption("Versión **v5.0 Estable** • Multiaño")
+    st.caption("Versión **v5.1 Estable** • Multiaño")
 
     sec_key = obtener_secreto("GEMINI_API_KEY")
     if sec_key:
         api_key = sec_key
-        st.success(f"🔒 Gemini conectada en Secrets (...{sec_key[-4:]})")
+        st.success(f"🔒 Gemini conectada en Secrets ({sec_key[:3]}...{sec_key[-4:]})")
     else:
-        st.warning("⚠️ Sin clave en Misterios (Secrets). Pégala abajo si vas a usar IA:")
-        man_key = st.text_input("Pegar clave Gemini (inicia por AIza...)", value="", placeholder="AIzaSy...")
+        st.warning("⚠️ Sin clave en Secrets. Pégala abajo si vas a usar IA:")
+        man_key = st.text_input("Pegar clave Gemini (AIza... o AQ....)", value="", placeholder="AIzaSy... o AQ....")
         api_key = limpiar_key(man_key)
         if api_key:
-            st.success(f"✅ Clave válida detectada (...{api_key[-4:]})")
+            st.success(f"✅ Clave detectada ({api_key[:3]}...{api_key[-4:]})")
 
     anio_gravable = int(
         st.number_input(
@@ -976,19 +1010,21 @@ with t1:
         f_certs = st.file_uploader("Sube PDFs o fotos de certificados", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True, key=f"cert_{rid}")
         if f_certs and st.button(f"🔍 Extraer {len(f_certs)} soporte(s) con IA Gemini", use_container_width=True):
             if not api_key:
-                st.error("🔑 Primero guarda `GEMINI_API_KEY = \"AIza...\"` en Configuración -> Misterios (Secrets) o pégala arriba a la izquierda.")
+                st.error("🔑 Configura tu clave en Configuración -> Secrets o pégala arriba a la izquierda.")
             else:
                 lista_c = []
+                barra = st.progress(0.0, text="Iniciando lectura inteligente de certificados...")
                 for idx_c, fc in enumerate(f_certs):
                     try:
-                        with st.spinner(f"Leyendo {fc.name} ({idx_c+1}/{len(f_certs)})..."):
-                            it = extraer_soporte_ia(api_key, fc.getvalue(), fc.type)
-                            it["archivo"] = fc.name
-                            lista_c.append(it)
-                            if idx_c + 1 < len(f_certs):
-                                time.sleep(1.0)
+                        barra.progress(idx_c / len(f_certs), text=f"Leyendo {fc.name} ({idx_c+1} de {len(f_certs)})...")
+                        it = extraer_soporte_ia(api_key, fc.getvalue(), fc.type)
+                        it["archivo"] = fc.name
+                        lista_c.append(it)
+                        if idx_c + 1 < len(f_certs):
+                            time.sleep(1.5)
                     except Exception as e:
                         st.error(f"Error en {fc.name}: {e}")
+                barra.empty()
                 st.session_state.mem_cert = lista_c
 
         if st.session_state.mem_cert:
@@ -1180,7 +1216,7 @@ with t5:
     preg = st.chat_input("Haz cualquier pregunta sobre tu declaración o casillas del Formulario 210...")
     if preg:
         if not api_key:
-            st.error("Guarda primero `GEMINI_API_KEY = \"AIza...\"` en Misterios (Secrets) o pégala en la barra lateral.")
+            st.error("Configura tu clave en Secrets o pégala en la barra lateral.")
         else:
             st.session_state.chat.append({"role": "user", "content": preg})
             with st.chat_message("user"):
