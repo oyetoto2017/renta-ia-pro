@@ -41,11 +41,10 @@ UVT_OFICIAL = {
     2026: 52_374,  # Resolución DIAN 000238 de 2025 (AG 2026 declarado en 2027)
 }
 
-# Porcentaje oficial Componente Inflacionario rendimientos financieros PN
 COMP_INFLACIONARIO_HISTORICO = {
     2023: 0.6671,
     2024: 0.5088,
-    2025: 0.5544,  # Ej: $781.000 * 55,44% = $433.000 (Casilla 59 Form 210)
+    2025: 0.5544,  # Ej: $781.461 * 55,44% -> $433.000 (Casilla 59 Form 210)
 }
 
 LIMITES_LEY_2277 = {
@@ -78,8 +77,7 @@ TABLA_ART_241 = [
 def uvt_sugerida_por_anio(anio: int) -> int:
     if anio in UVT_OFICIAL:
         return UVT_OFICIAL[anio]
-    ultimo_anio = max(UVT_OFICIAL.keys())
-    return UVT_OFICIAL[ultimo_anio]
+    return UVT_OFICIAL[max(UVT_OFICIAL.keys())]
 
 
 # ==============================================================================
@@ -89,7 +87,6 @@ def limpiar_api_key(raw_key: str) -> str:
     if not raw_key:
         return ""
     texto = str(raw_key).strip()
-    # Si el usuario pegó por error 'GEMINI_API_KEY = "AIza..."', extrae solo la clave real
     match = re.search(r"(AIza[0-9A-Za-z_\-]{25,})", texto)
     if match:
         return match.group(1)
@@ -143,19 +140,16 @@ def verificar_acceso() -> bool:
 
 
 def ejecutar_gemini_seguro(api_key: str, contents: Any, config: types.GenerateContentConfig) -> str:
-    """Ejecuta Gemini con limpieza de llave, respaldo automático de modelo y diagnóstico claro."""
     llave = limpiar_api_key(api_key)
     if not llave or not llave.startswith("AIza"):
         raise ValueError(
-            "La Gemini API Key ingresada no tiene un formato válido (debe empezar por 'AIza...'). "
-            "Verifica que no tenga espacios ni texto adicional en la barra lateral o en Secrets."
+            "La Gemini API Key ingresada no tiene un formato válido (debe iniciar por 'AIza...'). "
+            "Verifica que no tenga comillas ni espacios adicionales."
         )
 
     client = genai.Client(api_key=llave)
-    modelos = ["gemini-2.5-flash", "gemini-2.0-flash"]
     ultimo_error = None
-
-    for mod in modelos:
+    for mod in ["gemini-2.5-flash", "gemini-2.0-flash"]:
         try:
             resp = client.models.generate_content(model=mod, contents=contents, config=config)
             return resp.text
@@ -164,8 +158,7 @@ def ejecutar_gemini_seguro(api_key: str, contents: Any, config: types.GenerateCo
             codigo = getattr(e, "code", None)
             if codigo in (400, 401, 403):
                 raise ValueError(
-                    f"Google rechazó la API Key (Código {codigo}). Verifica en Google AI Studio que tu clave "
-                    "esté activa y sin restricciones bloqueadas, y pégala limpia sin comillas."
+                    f"Google rechazó la API Key (Código {codigo}). Revisa en Google AI Studio que la llave esté activa."
                 )
             continue
         except Exception as e:
@@ -173,8 +166,8 @@ def ejecutar_gemini_seguro(api_key: str, contents: Any, config: types.GenerateCo
             continue
 
     raise RuntimeError(
-        f"El servicio de IA está temporalmente saturado o alcanzó el límite gratuito por minuto. "
-        f"Espera 30 segundos y vuelve a intentar. (Detalle técnico: {type(ultimo_error).__name__})"
+        f"El servicio de IA alcanzó temporalmente el límite de consultas por minuto. "
+        f"Espera unos segundos y vuelve a intentar. ({type(ultimo_error).__name__})"
     )
 
 
@@ -192,11 +185,10 @@ def redondear_dian(valor: float) -> int:
 
 def estado_inicial_datos() -> Dict[str, Any]:
     return {
-        # Datos informativos del declarante
         "nombre_declarante": "",
         "nit_declarante": "",
         "cod_actividad": "8211",
-        # Patrimonio y Topes DIAN (Celdas C4 a C12)
+        # Patrimonio y Topes DIAN
         "efectivo": 0.0,
         "vehiculos": 0.0,
         "inmuebles": 0.0,
@@ -207,29 +199,26 @@ def estado_inicial_datos() -> Dict[str, Any]:
         "responsable_iva": False,
         "deudas": 0.0,
         "patrimonio_liquido_anterior": 0.0,
-        # Subcédula 1: Rentas de Trabajo Laborales (Casillas 32 a 42)
+        # Subcédulas Cédula General
         "ing_brutos_trabajo": 0.0,
         "salud_pension_trabajo": 0.0,
-        # Subcédula 2: Honorarios / Servicios sin vínculo laboral (Casillas 43 a 57)
         "ing_brutos_honorarios": 0.0,
         "salud_pension_honorarios": 0.0,
         "costos_honorarios": 0.0,
-        # Subcédula 3: Rentas de Capital CDT / Arriendos (Casillas 58 a 73)
         "ing_brutos_capital": 0.0,
         "incrngo_capital": 0.0,
         "costos_capital": 0.0,
-        # Subcédula 4: Rentas No Laborales (Casillas 74 a 90)
         "ing_brutos_no_laborales": 0.0,
         "incrngo_no_laborales": 0.0,
         "costos_no_laborales": 0.0,
-        # Cédula Pensiones, Dividendos y Ganancias Ocasionales
+        # Pensiones, Dividendos y Ganancias Ocasionales
         "ing_brutos_pensiones": 0.0,
         "salud_pensiones": 0.0,
         "dividendos_gravables": 0.0,
         "ing_ganancia_ocasional": 0.0,
         "costos_ganancia_ocasional": 0.0,
         "exenta_ganancia_ocasional": 0.0,
-        # Deducciones y Rentas Exentas Ley 2277
+        # Beneficios Ley 2277
         "intereses_vivienda": 0.0,
         "medicina_prepagada": 0.0,
         "meses_prepagada": 12,
@@ -237,7 +226,8 @@ def estado_inicial_datos() -> Dict[str, Any]:
         "gmf_certificado_100": 0.0,
         "aportes_afc_fpv": 0.0,
         "compras_factura_electronica": 0.0,
-        # Liquidación Privada: Retenciones, Saldos, Anticipo y Sanciones
+        "aplicar_beneficio_fe": False,
+        # Liquidación Privada
         "retenciones_anio": 0.0,
         "saldo_favor_anterior": 0.0,
         "anio_declara_num": 0,
@@ -263,49 +253,38 @@ def liquidar_declaracion_210(
 ) -> Dict[str, Any]:
     L = LIMITES_LEY_2277
 
-    # 1. PATRIMONIO (Casillas 29, 30, 31 redondeadas igual que Muisca)
+    # 1. PATRIMONIO (Casillas 29, 30, 31)
     pat_bruto_raw = d["efectivo"] + d["vehiculos"] + d["inmuebles"] + d["otros_activos"]
     c29_patrimonio_bruto = redondear_dian(pat_bruto_raw)
     c30_deudas = redondear_dian(d["deudas"])
     c31_patrimonio_liquido = max(0, c29_patrimonio_bruto - c30_deudas)
 
-    # 2. DEPURACIÓN POR SUBCÉDULAS CON REDONDEO INTERMEDIO MUISCA DIAN
-    # Subcédula Trabajo Laboral (Casillas 32-34)
-    c32_ing_trabajo = redondear_dian(d["ing_brutos_trabajo"])
-    c33_inc_trabajo = min(c32_ing_trabajo, redondear_dian(d["salud_pension_trabajo"]))
-    c34_renta_liq_trabajo = max(0, c32_ing_trabajo - c33_inc_trabajo)
-
-    # Subcédula Honorarios / Servicios sin relación laboral (Casillas 43-46)
-    c43_ing_honorarios = redondear_dian(d["ing_brutos_honorarios"])
-    c44_inc_honorarios = min(c43_ing_honorarios, redondear_dian(d["salud_pension_honorarios"]))
-    neto_honorarios = max(0, c43_ing_honorarios - c44_inc_honorarios)
-
-    # Subcédula Rentas de Capital (Casillas 58-61)
+    # 2. SUBCÉDULAS CAPITAL Y NO LABORALES
     c58_ing_capital = redondear_dian(d["ing_brutos_capital"])
     c59_inc_capital = min(c58_ing_capital, redondear_dian(d["incrngo_capital"]))
     neto_capital = max(0, c58_ing_capital - c59_inc_capital)
     c60_costos_capital = min(neto_capital, redondear_dian(d["costos_capital"]))
     c61_renta_liq_capital = max(0, neto_capital - c60_costos_capital)
 
-    # Subcédula Rentas No Laborales (Casillas 74-78)
     c74_ing_nolab = redondear_dian(d["ing_brutos_no_laborales"])
     c76_inc_nolab = min(c74_ing_nolab, redondear_dian(d["incrngo_no_laborales"]))
     neto_nolab = max(0, c74_ing_nolab - c76_inc_nolab)
     c77_costos_nolab = min(neto_nolab, redondear_dian(d["costos_no_laborales"]))
     c78_renta_liq_nolab = max(0, neto_nolab - c77_costos_nolab)
 
-    # Base de Ingresos Netos Cédula General para el tope del 40% (Art. 336 E.T.)
-    ing_brutos_cg = c32_ing_trabajo + c43_ing_honorarios + c58_ing_capital + c74_ing_nolab
-    incrngo_cg = c33_inc_trabajo + c44_inc_honorarios + c59_inc_capital + c76_inc_nolab
-    ing_netos_cg = c34_renta_liq_trabajo + neto_honorarios + neto_capital + neto_nolab
+    # 3. SIMULADOR MUISCA: RUTA A (Honorarios en C.32 con 25% Exento) vs RUTA B (Honorarios en C.43 con Costos C.45)
+    ing_trab_total_bruto = redondear_dian(d["ing_brutos_trabajo"]) + redondear_dian(d["ing_brutos_honorarios"])
+    inc_trab_total = min(
+        ing_trab_total_bruto,
+        redondear_dian(d["salud_pension_trabajo"]) + redondear_dian(d["salud_pension_honorarios"]),
+    )
+    ing_brutos_cg = ing_trab_total_bruto + c58_ing_capital + c74_ing_nolab
+    ing_netos_cg = max(0, ing_trab_total_bruto - inc_trab_total) + neto_capital + neto_nolab
 
-    # 3. DEDUCCIONES Y EXENCIONES SUJETAS A LA BOLSA DEL 40% / 1.340 UVT
-    hay_trabajo_o_hon = (c32_ing_trabajo + c43_ing_honorarios) > 0
-    base_laboral_bruta = c32_ing_trabajo + c43_ing_honorarios
-
+    hay_trabajo_o_hon = ing_trab_total_bruto > 0
     c38_vivienda = redondear_dian(min(d["intereses_vivienda"], L["vivienda_uvt"] * uvt))
     ded_prep = redondear_dian(min(d["medicina_prepagada"], d["meses_prepagada"] * L["prepagada_mes_uvt"] * uvt)) if hay_trabajo_o_hon else 0
-    ded_dep10 = redondear_dian(min(base_laboral_bruta * 0.10, 12 * L["dep_10pct_mes_uvt"] * uvt)) if (d["num_dependientes"] > 0 and hay_trabajo_o_hon) else 0
+    ded_dep10 = redondear_dian(min(ing_trab_total_bruto * 0.10, 12 * L["dep_10pct_mes_uvt"] * uvt)) if (d["num_dependientes"] > 0 and hay_trabajo_o_hon) else 0
     ded_gmf = redondear_dian(d["gmf_certificado_100"] * 0.50)
     c35_afc = redondear_dian(min(d["aportes_afc_fpv"], ing_brutos_cg * 0.30, L["afc_fpv_uvt"] * uvt))
 
@@ -313,51 +292,61 @@ def liquidar_declaracion_210(
     limite_40_cg = redondear_dian(min(ing_netos_cg * L["pct_bolsa_global"], L["tope_bolsa_uvt"] * uvt))
     tope_790_pesos = L["exenta_25_uvt"] * uvt
 
-    # Simulador Dual: Ruta A (25% Exento sobre trabajo + honorarios) vs Ruta B (Costos en Honorarios)
-    # Ruta A: Sin costos en casilla 45; 25% aplica sobre (Trabajo + Honorarios netos - deducciones)
-    c46_a = neto_honorarios
-    c91_a = c34_renta_liq_trabajo + c46_a + c61_renta_liq_capital + c78_renta_liq_nolab
-    base_25_a = max(0, (c34_renta_liq_trabajo + c46_a) - deducciones_comunes)
+    # RUTA A (Igual al Muisca cuando se elige el 25% exento: Trabajo + Servicios se declaran en Casillas 32-36)
+    c32_a = ing_trab_total_bruto
+    c33_a = inc_trab_total
+    c34_a = max(0, c32_a - c33_a)
+    c91_a = c34_a + c61_renta_liq_capital + c78_renta_liq_nolab
+    base_25_a = max(0, c34_a - deducciones_comunes)
     exenta_25_a = redondear_dian(min(base_25_a * 0.25, tope_790_pesos))
     solicitados_a = deducciones_comunes + exenta_25_a
     aceptados_40_a = min(solicitados_a, limite_40_cg, c91_a)
     remanente_a = max(0, c91_a - aceptados_40_a)
 
-    # Ruta B: Imputa costos en Honorarios (Casilla 45) y el 25% solo aplica a Salarios (Casilla 34) si existen
-    c45_b = min(neto_honorarios, redondear_dian(d["costos_honorarios"]))
-    c46_b = max(0, neto_honorarios - c45_b)
-    c91_b = c34_renta_liq_trabajo + c46_b + c61_renta_liq_capital + c78_renta_liq_nolab
-    base_25_b = max(0, c34_renta_liq_trabajo - deducciones_comunes)
+    # RUTA B (Honorarios van a Casillas 43-46 con costos en Casilla 45, sin 25% exento sobre honorarios)
+    c32_b = redondear_dian(d["ing_brutos_trabajo"])
+    c33_b = min(c32_b, redondear_dian(d["salud_pension_trabajo"]))
+    c34_b = max(0, c32_b - c33_b)
+    c43_b = redondear_dian(d["ing_brutos_honorarios"])
+    pila_disp_hon = redondear_dian(d["salud_pension_honorarios"]) + max(0, redondear_dian(d["salud_pension_trabajo"]) - c33_b)
+    c44_b = min(c43_b, pila_disp_hon)
+    neto_hon_b = max(0, c43_b - c44_b)
+    c45_b = min(neto_hon_b, redondear_dian(d["costos_honorarios"]))
+    c46_b = max(0, neto_hon_b - c45_b)
+    c91_b = c34_b + c46_b + c61_renta_liq_capital + c78_renta_liq_nolab
+    base_25_b = max(0, c34_b - deducciones_comunes)
     exenta_25_b = redondear_dian(min(base_25_b * 0.25, tope_790_pesos))
     solicitados_b = deducciones_comunes + exenta_25_b
     aceptados_40_b = min(solicitados_b, limite_40_cg, c91_b)
     remanente_b = max(0, c91_b - aceptados_40_b)
 
-    if d["costos_honorarios"] > 0 and c43_ing_honorarios > 0 and remanente_b < remanente_a:
-        estrategia = "Honorarios con Costos Procedentes (Casilla 45 — menor impuesto)"
-        c45_costos_hon = c45_b
-        c46_renta_liq_hon = c46_b
+    if d["costos_honorarios"] > 0 and c43_b > 0 and remanente_b < remanente_a:
+        estrategia = "Honorarios con Costos y Gastos (Casillas 43-46 — menor base gravable)"
+        c32_ing_trabajo, c33_inc_trabajo, c34_renta_liq_trabajo = c32_b, c33_b, c34_b
+        c43_ing_honorarios, c44_inc_honorarios, c45_costos_hon, c46_renta_liq_hon = c43_b, c44_b, c45_b, c46_b
         c91_renta_liq_cg = c91_b
         c36_exenta_25 = exenta_25_b
         beneficios_40_limitados = aceptados_40_b
         solicitados_bolsa_40 = solicitados_b
         remanente_cg = remanente_b
     else:
-        estrategia = "Renta Exenta del 25% Laboral (Casilla 36/48 — óptima Ley 2277)"
-        c45_costos_hon = 0
-        c46_renta_liq_hon = c46_a
+        estrategia = "Rentas de Trabajo con 25% Exento (Casillas 32-36 — óptima Ley 2277)"
+        c32_ing_trabajo, c33_inc_trabajo, c34_renta_liq_trabajo = c32_a, c33_a, c34_a
+        c43_ing_honorarios, c44_inc_honorarios, c45_costos_hon, c46_renta_liq_hon = 0, 0, 0, 0
         c91_renta_liq_cg = c91_a
         c36_exenta_25 = exenta_25_a
         beneficios_40_limitados = aceptados_40_a
         solicitados_bolsa_40 = solicitados_a
         remanente_cg = remanente_a
 
+    incrngo_cg = c33_inc_trabajo + c44_inc_honorarios + c59_inc_capital + c76_inc_nolab
     costos_totales_cg = c45_costos_hon + c60_costos_capital + c77_costos_nolab
 
     # 4. BENEFICIOS FUERA DEL LÍMITE DEL 40% (Casilla 28 Factura Electrónica + Casilla 139 Dependientes 72 UVT)
-    c28_ded_factura_1pct = redondear_dian(
+    ded_fe_potencial = redondear_dian(
         min(d["compras_factura_electronica"] * L["factura_elec_pct"], L["factura_elec_uvt"] * uvt)
     )
+    c28_ded_factura_1pct = ded_fe_potencial if d.get("aplicar_beneficio_fe", False) else 0
     c139_adicion_dependientes = (
         redondear_dian(min(int(d["num_dependientes"]), L["max_dep_extra"]) * L["dep_extra_uvt"] * uvt)
         if hay_trabajo_o_hon else 0
@@ -367,7 +356,7 @@ def liquidar_declaracion_210(
     c92_exentas_y_ded_limitadas = beneficios_40_limitados + beneficios_fuera_40
     c97_rlg_cedula_general = max(0, c91_renta_liq_cg - c92_exentas_y_ded_limitadas)
 
-    # 5. PENSIONES (Casillas 99-103), DIVIDENDOS (Casilla 107) Y GANANCIAS OCASIONALES (Casillas 112-115)
+    # 5. PENSIONES, DIVIDENDOS Y GANANCIAS OCASIONALES
     c99_pen_brutos = redondear_dian(d["ing_brutos_pensiones"])
     c100_pen_salud = min(c99_pen_brutos, redondear_dian(d["salud_pensiones"]))
     c101_pen_liquida = max(0, c99_pen_brutos - c100_pen_salud)
@@ -404,7 +393,7 @@ def liquidar_declaracion_210(
     obligado_bool = len(causales) > 0
     estado_obligacion = "Sí obligado a declarar" if obligado_bool else "No obligado a declarar"
 
-    # 7. LIQUIDACIÓN PRIVADA (Casillas 116 a 137 exactas del Formulario 210 Oficial)
+    # 7. LIQUIDACIÓN PRIVADA (Casillas 126 a 137)
     c126_impuesto_neto_renta = redondear_dian(calcular_impuesto_art241(c111_rlg_total, uvt))
     c127_impuesto_go = redondear_dian(c115_go_gravable * 0.15)
     c129_total_impuesto_cargo = c126_impuesto_neto_renta + c127_impuesto_go
@@ -447,7 +436,7 @@ def liquidar_declaracion_210(
     c136_total_saldo_pagar = max(0, balance_total)
     c137_total_saldo_favor = abs(min(0, balance_total))
 
-    # 8. AUDITORÍA PREVENTIVA Y OPORTUNIDADES DE AHORRO
+    # 8. AUDITORÍA PREVENTIVA Y OPORTUNIDADES
     alertas: List[str] = []
     pat_ant = redondear_dian(d["patrimonio_liquido_anterior"])
     if pat_ant > 0:
@@ -460,16 +449,20 @@ def liquidar_declaracion_210(
             )
 
     sugerencias: List[str] = []
+    if hay_trabajo_o_hon and inc_trab_total == 0:
+        sugerencias.append(
+            "Tienes ingresos de trabajo/servicios pero $0 en Salud y Pensión (Casilla 33): recuerda ingresar tus aportes PILA en la Pestaña 3."
+        )
+    if ded_fe_potencial > 0 and not d.get("aplicar_beneficio_fe", False):
+        sugerencias.append(
+            f"Detectamos compras con Factura Electrónica susceptibles del 1% (deducción adicional de ${ded_fe_potencial:,.0f} en Casilla 28). "
+            "Si las pagaste con tarjeta o medios electrónicos, activa el switch en la Pestaña 3."
+        )
     cupo_40 = max(0, limite_40_cg - solicitados_bolsa_40)
     if cupo_40 > 300_000 and c126_impuesto_neto_renta > 0:
         sugerencias.append(
             f"Tienes un cupo disponible de ${cupo_40:,.0f} en la bolsa del 40% / 1.340 UVT "
             f"(puedes restar 50% del GMF 4x1000, intereses de vivienda, medicina prepagada o aportes AFC/FPV)."
-        )
-    if c58_ing_capital > 0 and c59_inc_capital == 0:
-        sugerencias.append(
-            "Declaraste rendimientos financieros / CDT (Casilla 58), pero la Casilla 59 está en $0. "
-            "Usa el botón de 'Componente Inflacionario CDT' en la Pestaña 3 para restar la parte no gravada."
         )
 
     return {
@@ -477,7 +470,6 @@ def liquidar_declaracion_210(
         "estado_obligacion": estado_obligacion,
         "causales_obligacion": causales,
         "estrategia": estrategia,
-        # Casillas oficiales exactas Formulario 210
         "c28_factura_electronica": c28_ded_factura_1pct,
         "c29_patrimonio_bruto": c29_patrimonio_bruto,
         "c30_deudas": c30_deudas,
@@ -519,11 +511,6 @@ def liquidar_declaracion_210(
         "c137_total_saldo_favor": c137_total_saldo_favor,
         "c138_num_dependientes": int(d["num_dependientes"]),
         "c139_adicion_dependientes": c139_adicion_dependientes,
-        # Aliases para Dashboard
-        "beneficios_aceptados_40": beneficios_40_limitados,
-        "beneficios_fuera_40": beneficios_fuera_40,
-        "costos_gastos_cg": costos_totales_cg,
-        "incrngo_cg": incrngo_cg,
         "alivios_totales": alivios_totales,
         "ahorro_anticipo": ahorro_ant,
         "alertas_auditoria": alertas,
@@ -532,16 +519,16 @@ def liquidar_declaracion_210(
 
 
 # ==============================================================================
-# 4. LECTOR NATIVO EXÓGENA DIAN (SIN IA) + MIGRADOR MACRO + GEMINI MULTIMODAL
+# 4. MOTOR EXÓGENA DIAN CALIBRADO AL 100% + MIGRADOR MACRO + GEMINI MULTIMODAL
 # ==============================================================================
 class CertificadoExtraido(BaseModel):
-    tipo_documento: str = Field(description="Ej: Certificado 220, Extracto Bancario, Certificado CDT, Predial")
-    entidad: str = Field(description="Banco o empresa emisora")
+    tipo_documento: str = Field(description="Ej: Certificado 220, Planilla PILA, Certificado CDT, Predial")
+    entidad: str = Field(description="Banco, operador o empresa emisora")
     efectivo_bancos_dic31: float = Field(default=0.0, description="Saldo en cuentas a 31 de diciembre")
     valor_inmueble_o_cdt_dic31: float = Field(default=0.0, description="Avalúo predial o capital CDT vigente a dic 31")
     saldo_deuda_dic31: float = Field(default=0.0, description="Saldo capital de deudas/hipotecas a dic 31")
-    ingresos_brutos_trabajo: float = Field(default=0.0, description="Ingresos brutos laborales o salarios (Casilla 32)")
-    ingresos_brutos_honorarios: float = Field(default=0.0, description="Honorarios o servicios sin relación laboral (Casilla 43)")
+    ingresos_brutos_trabajo: float = Field(default=0.0, description="Ingresos laborales o salarios (Casilla 32)")
+    ingresos_brutos_honorarios: float = Field(default=0.0, description="Honorarios o servicios independientes (Casilla 43)")
     salud_pension_obligatoria: float = Field(default=0.0, description="Suma de salud obligatoria + pensión obligatoria")
     ingresos_capital_cdt: float = Field(default=0.0, description="Intereses o rendimientos financieros pagados (Casilla 58)")
     componente_inflacionario_cdt: float = Field(default=0.0, description="Valor no gravado / componente inflacionario CDT (Casilla 59)")
@@ -554,7 +541,7 @@ class CertificadoExtraido(BaseModel):
 
 def _nvl(val) -> float:
     try:
-        if val is None or isinstance(val, bool):
+        if val is None or isinstance(val, bool) or pd.isna(val):
             return 0.0
         if isinstance(val, str):
             limpio = re.sub(r"[^\d.\-]", "", val.replace(",", ""))
@@ -564,12 +551,14 @@ def _nvl(val) -> float:
         return 0.0
 
 
-def importar_macro_xlsm(archivo_bytes: bytes) -> dict:
+def importar_macro_xlsm(archivo_bytes: bytes, anio_gravable: int) -> dict:
     wb = openpyxl.load_workbook(io.BytesIO(archivo_bytes), data_only=True)
     if "Ingreso_Datos" not in wb.sheetnames:
         raise ValueError("El archivo Excel no contiene la hoja 'Ingreso_Datos'.")
     ws = wb["Ingreso_Datos"]
     iva_txt = str(ws["C11"].value or "").strip().upper()
+    ing_cap = _nvl(ws["C15"].value)
+    pct_inf = COMP_INFLACIONARIO_HISTORICO.get(anio_gravable, 0.5544)
     out = {
         "efectivo": _nvl(ws["C4"].value),
         "vehiculos": _nvl(ws["C5"].value),
@@ -580,10 +569,13 @@ def importar_macro_xlsm(archivo_bytes: bytes) -> dict:
         "compras_totales": _nvl(ws["C10"].value),
         "responsable_iva": iva_txt in ("SI", "SÍ", "YES", "1", "TRUE"),
         "deudas": _nvl(ws["C12"].value),
-        "ing_brutos_trabajo": _nvl(ws["C14"].value),
-        "ing_brutos_capital": _nvl(ws["C15"].value),
+        "ing_brutos_honorarios": _nvl(ws["C14"].value),
+        "ing_brutos_trabajo": 0.0,
+        "ing_brutos_capital": ing_cap,
+        "incrngo_capital": float(redondear_dian(ing_cap * pct_inf)) if ing_cap > 0 else 0.0,
         "retenciones_anio": _nvl(ws["C16"].value),
-        "salud_pension_trabajo": _nvl(ws["C18"].value),
+        "salud_pension_honorarios": _nvl(ws["C18"].value),
+        "salud_pension_trabajo": 0.0,
         "intereses_vivienda": _nvl(ws["C19"].value),
         "saldo_favor_anterior": _nvl(ws["C20"].value),
     }
@@ -595,7 +587,7 @@ def importar_macro_xlsm(archivo_bytes: bytes) -> dict:
 
 
 def limpiar_y_clasificar_exogena_dian(archivo_bytes: bytes, anio_gravable: int) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """Limpia los encabezados del Excel oficial de Exógena DIAN y pre-calcula casillas sin requerir IA."""
+    """Procesa el formato oficial de Exógena DIAN desduplicando columnas NIT, topes resumen y documentos soporte."""
     xls = pd.ExcelFile(io.BytesIO(archivo_bytes))
     hoja = xls.sheet_names[0]
     for h in xls.sheet_names:
@@ -603,54 +595,107 @@ def limpiar_y_clasificar_exogena_dian(archivo_bytes: bytes, anio_gravable: int) 
             hoja = h
             break
 
-    df_raw = pd.read_excel(xls, sheet_name=hoja, header=None).dropna(how="all")
+    df_raw = pd.read_excel(xls, sheet_name=hoja, header=None)
 
-    # Detectar fila real de encabezados de la DIAN (evita columnas 'Unnamed')
+    # 1. Extraer metadatos del encabezado superior DIAN (Filas 0 a 14)
+    nit_meta, nombre_meta, anio_meta = "", "", None
+    for idx in range(min(15, len(df_raw))):
+        fila_vals = [str(x).strip() if pd.notna(x) else "" for x in df_raw.iloc[idx].values]
+        etiqueta = fila_vals[0].lower() if fila_vals else ""
+        valor_celda = fila_vals[2] if len(fila_vals) > 2 else ""
+        if "identificacion:" in etiqueta.replace("ó", "o") and valor_celda:
+            nit_meta = valor_celda.split(".")[0].strip()
+        elif ("nombres" in etiqueta or "razon social" in etiqueta.replace("ó", "o")) and valor_celda:
+            nombre_meta = valor_celda.strip()
+        elif "año al que se refiere" in etiqueta and valor_celda.isdigit():
+            anio_meta = int(valor_celda)
+
+    df_sin_vacios = df_raw.dropna(how="all").reset_index(drop=True)
+
+    # 2. Detectar fila exacta de encabezados y eliminar nombres de columna duplicados ('NIT')
     fila_header = None
-    claves_header = ["nit", "identific", "razon", "razón", "tercero", "concepto", "valor", "tope", "descrip", "guia", "guía"]
+    claves_header = ["nit", "razon", "razón", "detalle", "valor", "uso declaracion", "uso declaración", "adicional"]
     mejor_puntaje = 0
-    for idx in range(min(30, len(df_raw))):
-        textos_fila = [str(x).strip().lower() for x in df_raw.iloc[idx].values if pd.notna(x)]
+    for idx in range(min(30, len(df_sin_vacios))):
+        textos_fila = [str(x).strip().lower() for x in df_sin_vacios.iloc[idx].values if pd.notna(x)]
         puntaje = sum(1 for celda in textos_fila if any(k in celda for k in claves_header))
-        if puntaje > mejor_puntaje and puntaje >= 2:
+        if puntaje > mejor_puntaje and puntaje >= 3:
             mejor_puntaje = puntaje
             fila_header = idx
 
     if fila_header is not None:
-        nuevas_cols = [
-            str(c).strip() if pd.notna(c) and str(c).strip() else f"Col_{i}"
-            for i, c in enumerate(df_raw.iloc[fila_header].values)
+        raw_cols = [
+            str(c).strip() if pd.notna(c) and str(c).strip() else f"Columna_{i+1}"
+            for i, c in enumerate(df_sin_vacios.iloc[fila_header].values)
         ]
-        df = df_raw.iloc[fila_header + 1 :].copy()
+        nuevas_cols = []
+        vistos = {}
+        contador_nit = 0
+        for c in raw_cols:
+            nom = re.sub(r"\s+", " ", c).strip()
+            if nom.upper() == "NIT":
+                contador_nit += 1
+                nom = "NIT Reportante" if contador_nit == 1 else ("NIT Declarante" if contador_nit == 2 else f"NIT_{contador_nit}")
+            elif nom.lower().startswith("nombre /"):
+                nom = "Entidad / Persona que Reporta"
+            elif nom.lower().startswith("nombre/raz"):
+                nom = "Nombre Reportado"
+
+            if nom in vistos:
+                vistos[nom] += 1
+                nom = f"{nom}_{vistos[nom]}"
+            else:
+                vistos[nom] = 1
+            nuevas_cols.append(nom)
+
+        df = df_sin_vacios.iloc[fila_header + 1 :].copy()
         df.columns = nuevas_cols
     else:
-        df = df_raw.copy()
+        df = df_sin_vacios.copy()
         df.columns = [f"Columna_{i+1}" for i in range(df.shape[1])]
 
     df = df.dropna(how="all").reset_index(drop=True)
 
-    # Identificar columna de valor numérico y columnas de texto descriptivo
-    col_valor = None
-    for col in df.columns:
-        if any(p in str(col).lower() for p in ["valor", "monto", "saldo", "pago", "cuantia", "cuantía"]):
-            col_valor = col
-            break
-    if col_valor is None and df.shape[1] >= 6:
-        col_valor = df.columns[5]
-    elif col_valor is None:
-        col_valor = df.columns[-1]
+    col_nit_rep = next((c for c in df.columns if "nit reportante" in c.lower() or c.lower() == "columna_1"), df.columns[0])
+    col_detalle = next((c for c in df.columns if "detalle" in c.lower() or "concepto" in c.lower()), df.columns[min(4, len(df.columns) - 1)])
+    col_valor = next((c for c in df.columns if any(p in c.lower() for p in ["valor", "monto", "cuantia", "cuantía"])), df.columns[min(5, len(df.columns) - 1)])
+    col_uso = next((c for c in df.columns if "uso" in c.lower() or "sugerida" in c.lower()), None)
+
+    # 3. Separar las 5 filas resumen 'Tope 1..5' de la DIAN frente a los terceros reales
+    mask_tope = df[col_nit_rep].isna() & df[col_detalle].astype(str).str.strip().str.lower().str.startswith("tope")
+    df_topes_dian = df[mask_tope].copy()
+    df_terceros = df[~mask_tope].copy()
+
+    topes_oficiales = {}
+    for _, r_t in df_topes_dian.iterrows():
+        k_t = str(r_t[col_detalle]).strip().lower()
+        v_t = _nvl(r_t[col_valor])
+        if "tope 1" in k_t:
+            topes_oficiales["tope_1_ingresos"] = v_t
+        elif "tope 2" in k_t:
+            topes_oficiales["tope_2_patrimonio"] = v_t
+        elif "tope 3" in k_t:
+            topes_oficiales["tope_3_tc"] = v_t
+        elif "tope 4" in k_t:
+            topes_oficiales["tope_4_movimientos"] = v_t
+        elif "tope 5" in k_t:
+            topes_oficiales["tope_5_compras"] = v_t
 
     resumen = {
-        "nombre_detectado": "",
-        "nit_detectado": "",
+        "nombre_detectado": nombre_meta,
+        "nit_detectado": nit_meta,
+        "anio_detectado": anio_meta,
         "efectivo_bancos": 0.0,
-        "inversiones_cdt": 0.0,
+        "inversiones_cdt_saldo": 0.0,
         "inmuebles_vehiculos": 0.0,
         "deudas": 0.0,
         "consignaciones_tope4": 0.0,
         "tarjetas_credito": 0.0,
         "compras_totales": 0.0,
+        "factura_electronica_1pct": 0.0,
         "ing_trabajo": 0.0,
+        "ing_honorarios": 0.0,
+        "ing_no_laborales": 0.0,
         "salud_pension": 0.0,
         "ing_capital": 0.0,
         "incrngo_capital_sugerido": 0.0,
@@ -658,74 +703,129 @@ def limpiar_y_clasificar_exogena_dian(archivo_bytes: bytes, anio_gravable: int) 
         "intereses_vivienda": 0.0,
         "medicina_prepagada": 0.0,
         "gmf_100": 0.0,
-        "factura_electronica": 0.0,
         "notas": [],
     }
 
-    for _, row in df.iterrows():
+    ing_por_nit = {}
+
+    for _, row in df_terceros.iterrows():
         val = _nvl(row.get(col_valor, 0))
-        if val <= 0:
+        if val == 0:
             continue
 
-        # Capturar NIT/Nombre del declarante si están en las columnas estándar DIAN (cols 2 y 3)
         if not resumen["nit_detectado"] and len(row) >= 4:
-            posible_doc = str(row.iloc[2] or "").strip().split(".")[0]
-            posible_nom = str(row.iloc[3] or "").strip()
-            if posible_doc.isdigit() and len(posible_doc) >= 6:
-                resumen["nit_detectado"] = posible_doc
-            if len(posible_nom) >= 5 and "nan" not in posible_nom.lower():
-                resumen["nombre_detectado"] = posible_nom
+            pos_doc = str(row.iloc[2] or "").strip().split(".")[0]
+            pos_nom = str(row.iloc[3] or "").strip()
+            if pos_doc.isdigit() and len(pos_doc) >= 6:
+                resumen["nit_detectado"] = pos_doc
+            if len(pos_nom) >= 5 and "nan" not in pos_nom.lower():
+                resumen["nombre_detectado"] = pos_nom
 
-        texto_fila = " ".join(str(v).lower() for k, v in row.items() if k != col_valor and pd.notna(v))
-        texto_norm = (
-            texto_fila.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
-        )
+        nit_r = str(row.get(col_nit_rep, "") or "").strip().split(".")[0]
+        det = str(row.get(col_detalle, "") or "").strip().lower()
+        uso = str(row.get(col_uso, "") or "").strip().lower() if col_uso else ""
 
-        # Clasificación por reglas tributarias DIAN
-        if any(w in texto_norm for w in ["retencion", "retefuente", "valor retenido"]):
-            resumen["retenciones"] += val
-        elif any(w in texto_norm for w in ["cdt rendimiento", "rendimientos financieros", "intereses pagados", "rendimiento"]):
-            resumen["ing_capital"] += val
-        elif any(w in texto_norm for w in ["valor total de consignaciones", "consignaciones", "tope 4"]):
-            resumen["consignaciones_tope4"] += val
-            if "cdt inversion" in texto_norm or "apertura" in texto_norm:
-                resumen["inversiones_cdt"] += val
-        elif any(w in texto_norm for w in ["saldo", "cuenta de ahorro", "cuenta corriente", "deposito"]) and "pasivo" not in texto_norm and "deuda" not in texto_norm:
-            resumen["efectivo_bancos"] += val
-        elif any(w in texto_norm for w in ["avaluo", "predial", "inmueble", "vehiculo", "automotor"]):
-            resumen["inmuebles_vehiculos"] += val
-        elif any(w in texto_norm for w in ["pasivo", "saldo deuda", "obligacion financiera", "saldo capital", "credito hipotecario saldo"]):
-            resumen["deudas"] += val
-        elif any(w in texto_norm for w in ["aporte obligatorio", "salud obligatoria", "pension obligatoria"]):
-            resumen["salud_pension"] += val
-        elif any(w in texto_norm for w in ["intereses de vivienda", "intereses credito hipotecario", "leasing habitacional"]):
-            resumen["intereses_vivienda"] += val
-        elif any(w in texto_norm for w in ["prepagada", "poliza de salud", "plan complementario"]):
-            resumen["medicina_prepagada"] += val
-        elif any(w in texto_norm for w in ["gmf", "4x1000", "gravamen a los movimientos"]):
-            resumen["gmf_100"] += val
-        elif any(w in texto_norm for w in ["consumos tarjeta", "tarjeta de credito", "tope 2"]):
-            resumen["tarjetas_credito"] += val
-        elif "factura electronica" in texto_norm:
-            resumen["factura_electronica"] += val
-        elif any(w in texto_norm for w in ["compras", "tope 3"]) and "ingreso" not in texto_norm:
+        det_n = det.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
+        uso_n = uso.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
+
+        if "susceptible de beneficio" in det_n:
+            resumen["factura_electronica_1pct"] += val
+            continue
+        if "tope 5" in uso_n or "facturas tras ajustes" in det_n:
             resumen["compras_totales"] += val
-        elif any(w in texto_norm for w in ["salario", "honorario", "servicio", "ingresos docu", "pagos laborales", "tope 1", "son los ingresos"]):
-            resumen["ing_trabajo"] += val
+            continue
+        if "tope 3" in uso_n or "consumos tarjeta" in det_n:
+            resumen["tarjetas_credito"] += val
+            continue
+        if "tope 4" in uso_n or "movimientos en cuentas" in det_n or "inversion efectuada" in det_n:
+            resumen["consignaciones_tope4"] += val
+            continue
+        if "tope 2" in uso_n or "r29" in uso_n or "saldo cuentas" in det_n or "saldo cdt" in det_n:
+            if val < 0 or ("r30" in uso_n and "r29" not in uso_n) or "pasivo" in det_n or "deuda" in det_n:
+                resumen["deudas"] += abs(val)
+            elif any(k in det_n for k in ["cdt", "inversion", "accion", "fiducia", "fondo"]):
+                resumen["inversiones_cdt_saldo"] += val
+            elif any(k in det_n for k in ["inmueble", "predial", "avaluo", "vehiculo", "automotor"]):
+                resumen["inmuebles_vehiculos"] += val
+            else:
+                resumen["efectivo_bancos"] += val
+            continue
+        if "r132" in uso_n or "retencion" in det_n or "valor retenido" in det_n:
+            resumen["retenciones"] += val
+            continue
+        if "r58" in uso_n or "cdt rendimientos" in det_n or "rendimientos financieros" in det_n:
+            resumen["ing_capital"] += val
+            continue
+        if "documentos soporte" in det_n or "facturas electronicas de venta" in det_n:
+            ing_por_nit.setdefault(nit_r, {"trab": 0.0, "hon": 0.0, "nolab": 0.0, "doc_sop": 0.0})
+            if det_n.startswith("ajuste") or "descuenta automaticamente" in uso_n:
+                ing_por_nit[nit_r]["doc_sop"] -= val
+            else:
+                ing_por_nit[nit_r]["doc_sop"] += val
+            continue
+        if "r33" in uso_n or "r44" in uso_n or "salud obligatoria" in det_n or "pension obligatoria" in det_n:
+            resumen["salud_pension"] += val
+            continue
+        if "r38" in uso_n or "intereses de vivienda" in det_n or "credito hipotecario" in det_n:
+            resumen["intereses_vivienda"] += val
+            continue
+        if "r39" in uso_n or "prepagada" in det_n or "poliza de salud" in det_n:
+            resumen["medicina_prepagada"] += val
+            continue
+        if "gmf" in det_n or "4x1000" in det_n:
+            resumen["gmf_100"] += val
+            continue
 
+        if "r32" in uso_n or "salarios" in det_n or "pagos laborales" in det_n:
+            ing_por_nit.setdefault(nit_r, {"trab": 0.0, "hon": 0.0, "nolab": 0.0, "doc_sop": 0.0})
+            ing_por_nit[nit_r]["trab"] += val
+        elif "r43" in uso_n or "honorarios" in det_n or "servicios" in det_n:
+            ing_por_nit.setdefault(nit_r, {"trab": 0.0, "hon": 0.0, "nolab": 0.0, "doc_sop": 0.0})
+            ing_por_nit[nit_r]["hon"] += val
+        elif "r74" in uso_n or "tope 1" in uso_n:
+            ing_por_nit.setdefault(nit_r, {"trab": 0.0, "hon": 0.0, "nolab": 0.0, "doc_sop": 0.0})
+            ing_por_nit[nit_r]["nolab"] += val
+
+    # Regla Oficial DIAN por NIT: Mayor valor entre Exógena e Ingresos por Documentos Soporte netos
+    for _, d_nit in ing_por_nit.items():
+        exo_sum = d_nit["trab"] + d_nit["hon"] + d_nit["nolab"]
+        doc_neto = max(0.0, d_nit["doc_sop"])
+        if exo_sum >= doc_neto:
+            resumen["ing_trabajo"] += d_nit["trab"]
+            resumen["ing_honorarios"] += d_nit["hon"]
+            resumen["ing_no_laborales"] += d_nit["nolab"]
+        else:
+            dif = doc_neto - exo_sum
+            resumen["ing_trabajo"] += d_nit["trab"]
+            resumen["ing_honorarios"] += d_nit["hon"] + dif
+            resumen["ing_no_laborales"] += d_nit["nolab"]
+
+    if "tope_4_movimientos" in topes_oficiales and topes_oficiales["tope_4_movimientos"] > 0:
+        resumen["consignaciones_tope4"] = topes_oficiales["tope_4_movimientos"]
+    if "tope_5_compras" in topes_oficiales and topes_oficiales["tope_5_compras"] > 0:
+        resumen["compras_totales"] = topes_oficiales["tope_5_compras"]
+    if "tope_3_tc" in topes_oficiales:
+        resumen["tarjetas_credito"] = topes_oficiales["tope_3_tc"]
+
+    anio_ref = anio_meta or anio_gravable
     if resumen["ing_capital"] > 0:
-        pct_inf = COMP_INFLACIONARIO_HISTORICO.get(anio_gravable, 0.5544)
-        resumen["incrngo_capital_sugerido"] = redondear_dian(resumen["ing_capital"] * pct_inf)
-        resumen["notas"].append(
-            f"Se calculó un Componente Inflacionario estimado de ${resumen['incrngo_capital_sugerido']:,.0f} "
-            f"({pct_inf*100:.2f}%) sobre tus rendimientos de CDT (${resumen['ing_capital']:,.0f}). Verifica el valor exacto en tu certificado bancario."
-        )
-    if resumen["inversiones_cdt"] > 0:
-        resumen["notas"].append(
-            "Ojo con renovaciones de CDT: En Patrimonio Bruto (Casilla 29) solo debes dejar el saldo de CDTs vigentes a 31 de diciembre, no la suma de renovaciones del año."
-        )
+        pct_inf = COMP_INFLACIONARIO_HISTORICO.get(anio_ref, 0.5544)
+        resumen["incrngo_capital_sugerido"] = float(redondear_dian(resumen["ing_capital"] * pct_inf))
 
-    return df, resumen
+    resumen["notas"].append(
+        "Completa manualmente en las Pestañas 2 y 3 lo que nunca viene en Exógena: "
+        "1) Inmuebles/lotes y vehículos, 2) Planilla PILA de Salud y Pensión como independiente, y 3) Saldo a favor año anterior."
+    )
+
+    # Normalizar tipos para evitar errores de visualización PyArrow en st.dataframe
+    df_vista = df_terceros.copy().reset_index(drop=True)
+    for c in df_vista.columns:
+        if c == col_valor:
+            df_vista[c] = df_vista[c].apply(_nvl)
+        else:
+            df_vista[c] = df_vista[c].apply(lambda x: "" if pd.isna(x) else str(x).strip())
+
+    return df_vista, resumen
 
 
 def extraer_con_gemini_hibrido(api_key: str, archivo_bytes: bytes, mime_type: str) -> dict:
@@ -742,8 +842,7 @@ def extraer_con_gemini_hibrido(api_key: str, archivo_bytes: bytes, mime_type: st
     contenidos.append(
         "Eres un auditor tributario experto en Colombia (DIAN). Extrae en pesos (COP) los valores "
         "exactos de este soporte tributario. Si un concepto no aparece, devuelve 0. Suma salud obligatoria "
-        "y pensión obligatoria en 'salud_pension_obligatoria'. Si es certificado de CDT, separa los intereses "
-        "pagados (Casilla 58) y el componente inflacionario no constitutivo de renta (Casilla 59)."
+        "y pensión obligatoria en 'salud_pension_obligatoria'."
     )
 
     cfg = types.GenerateContentConfig(
@@ -758,10 +857,10 @@ def extraer_con_gemini_hibrido(api_key: str, archivo_bytes: bytes, mime_type: st
 def auditar_exogena_ia(api_key: str, df_exo: pd.DataFrame) -> str:
     csv_muestra = df_exo.head(140).to_csv(index=False)
     prompt = (
-        "Actúa como Auditor Tributario Senior DIAN Colombia. Revisa este reporte limpio de Información Exógena y explica brevemente:\n"
-        "1. Qué terceros reportan los mayores movimientos y en qué casillas del Formulario 210 van.\n"
-        "2. Qué registros parecen renovaciones de CDT, traslados entre cuentas propias o consignaciones que obligan a declarar pero NO son ingreso gravado.\n"
-        "3. Recomendaciones prácticas para cruzar contra extractos bancarios y certificados.\n\n"
+        "Actúa como Auditor Tributario Senior DIAN Colombia. Revisa este reporte limpio de terceros y explica:\n"
+        "1. Qué entidades explican el cumplimiento de topes (ej. renovaciones de CDT y movimientos bancarios).\n"
+        "2. Cruce entre Servicios reportados y Documentos Soporte / Notas de Ajuste.\n"
+        "3. Soportes físicos que el contribuyente debe guardar en su carpeta tributaria.\n\n"
         f"DATOS EXÓGENA:\n{csv_muestra}"
     )
     cfg = types.GenerateContentConfig(temperature=0.1)
@@ -772,9 +871,8 @@ def consultar_estratega_rag(api_key: str, pregunta: str, res_liq: dict, uvt: flo
     instruccion = (
         f"Eres un Contador Público Tributarista Senior en Colombia experto en Formulario 210 y Ley 2277 de 2022. "
         f"Año Gravable: {anio} | UVT aplicada: ${uvt:,.0f} COP. "
-        f"Liquidación oficial actual calculada por el motor determinista: {json.dumps(res_liq, ensure_ascii=False)}. "
-        "Responde de forma clara, estratégica y citando casillas del Formulario 210 y artículos del Estatuto Tributario. "
-        "Usa siempre las cifras exactas ya calculadas sin alterarlas."
+        f"Liquidación oficial calculada por el motor determinista: {json.dumps(res_liq, ensure_ascii=False)}. "
+        "Responde de forma clara, estratégica y citando casillas del Formulario 210 y artículos del Estatuto Tributario."
     )
     cfg = types.GenerateContentConfig(system_instruction=instruccion, temperature=0.2)
     return ejecutar_gemini_seguro(api_key, pregunta, cfg)
@@ -789,11 +887,11 @@ def construir_filas_210(res: dict) -> List[Tuple[str, str, int]]:
         ("29", "Total patrimonio bruto", res["c29_patrimonio_bruto"]),
         ("30", "Deudas", res["c30_deudas"]),
         ("31", "Total patrimonio líquido (29 - 30)", res["c31_patrimonio_liquido"]),
-        ("32", "Ingresos brutos Rentas de Trabajo (Salarios / Laborales)", res["c32_ing_trabajo"]),
-        ("33", "Ingresos no constitutivos de renta Trabajo (Salud + Pensión)", res["c33_inc_trabajo"]),
+        ("32", "Ingresos brutos Rentas de Trabajo (Salarios / Servicios con 25% exento)", res["c32_ing_trabajo"]),
+        ("33", "Ingresos no constitutivos de renta Trabajo (Salud + Pensión PILA)", res["c33_inc_trabajo"]),
         ("34", "Renta líquida Trabajo (32 - 33)", res["c34_renta_liq_trabajo"]),
         ("36", "Renta exenta 25% laboral calculada (Art. 206 num. 10)", res["c36_exenta_25"]),
-        ("43", "Ingresos brutos Honorarios / Servicios sin relación laboral", res["c43_ing_honorarios"]),
+        ("43", "Ingresos brutos Honorarios sujetos a costos y gastos", res["c43_ing_honorarios"]),
         ("44", "Ingresos no constitutivos de renta Honorarios", res["c44_inc_honorarios"]),
         ("45", "Costos y deducciones procedentes Honorarios", res["c45_costos_honorarios"]),
         ("46", "Renta líquida Honorarios (43 - 44 - 45)", res["c46_renta_liq_honorarios"]),
@@ -922,7 +1020,7 @@ if "chat_mensajes" not in st.session_state:
 v = st.session_state.form_version
 d = st.session_state.datos
 
-# --- BARRA LATERAL CON AÑOS FUTUROS ILIMITADOS ---
+# --- BARRA LATERAL ---
 with st.sidebar:
     st.title("⚙️ Parámetros DIAN")
     api_secret = obtener_secreto("GEMINI_API_KEY")
@@ -938,15 +1036,15 @@ with st.sidebar:
         api_key = limpiar_api_key(raw_input_key)
 
     anio_actual = datetime.date.today().year
-    anio_gravable_sugerido = anio_actual - 1
+    anio_default = st.session_state.get("anio_detectado_exo", anio_actual - 1)
     anio_gravable = int(
         st.number_input(
             "📅 Año Gravable a Declarar (Cualquier año)",
             min_value=2020,
             max_value=2100,
-            value=anio_gravable_sugerido,
+            value=int(anio_default),
             step=1,
-            help="Sirve para cualquier año presente o futuro (2025, 2026, 2027, 2030...).",
+            help="Funciona para cualquier año presente o futuro (2025, 2026, 2027, 2030...).",
         )
     )
 
@@ -957,7 +1055,6 @@ with st.sidebar:
         value=int(uvt_sugerida),
         step=100,
         key=f"uvt_{anio_gravable}_{v}",
-        help="Para años futuros nuevos, escribe aquí el valor de la UVT oficial que publique la DIAN.",
     )
 
     with st.expander("Ajustar Topes UVT y Sanción"):
@@ -995,6 +1092,7 @@ with st.sidebar:
         if st.button("✅ Sí, limpiar todo", type="primary", use_container_width=True):
             st.session_state.datos = estado_inicial_datos()
             st.session_state.pop("uvt_migrada", None)
+            st.session_state.pop("anio_detectado_exo", None)
             st.session_state.ultimo_certificado = None
             st.session_state.auditoria_exogena = None
             st.session_state.chat_mensajes = []
@@ -1003,7 +1101,7 @@ with st.sidebar:
 
 res = liquidar_declaracion_210(d, valor_uvt, uvt_pat, uvt_ing, uvt_sancion)
 
-# --- ENCABEZADO Y TABLERO KPI SIN TEXTO CORTADO ---
+# --- ENCABEZADO Y TABLERO KPI ---
 st.title(f"📊 RentaIA Pro — Liquidador & Auditor Formulario 210 (AG {anio_gravable})")
 
 m1, m2, m3, m4, m5 = st.columns(5)
@@ -1029,77 +1127,78 @@ t1, t2, t3, t4, t5 = st.tabs([
     "⚖️ 5. Consultor Tributario IA",
 ])
 
-# PESTAÑA 1: EXÓGENA DETERMINISTA + LECTOR GEMINI + MIGRADOR MACRO
+# PESTAÑA 1: EXÓGENA NATIVA + LECTOR GEMINI + MIGRADOR MACRO
 with t1:
     col_izq, col_der = st.columns(2)
 
     with col_izq:
         st.subheader("📊 A. Autollenado desde Información Exógena DIAN")
         up_exo = st.file_uploader(
-            "Sube el Excel de Información Exógena descargado de la DIAN (No requiere IA para sumar)",
+            "Sube el Excel de Información Exógena descargado de la DIAN (Cálculo instantáneo sin IA)",
             type=["xlsx", "xls"],
         )
         if up_exo:
             try:
                 df_exo, res_exo = limpiar_y_clasificar_exogena_dian(up_exo.getvalue(), anio_gravable)
-                st.caption(f"Registros limpios procesados: **{len(df_exo)}** | Titular: **{res_exo['nombre_detectado'] or 'Detectado'}**")
-                st.dataframe(df_exo, use_container_width=True, height=210)
+                st.caption(
+                    f"Terceros procesados: **{len(df_exo)}** | "
+                    f"Declarante: **{res_exo['nombre_detectado'] or 'Detectado'}** (ID: **{res_exo['nit_detectado'] or 'N/A'}**)"
+                )
+                st.dataframe(df_exo, use_container_width=True, height=220)
 
-                st.markdown("**Resumen Automático Detectado en tu Exógena:**")
+                st.markdown("**Resumen Oficial Clasificado de tu Exógena:**")
                 df_res_exo = pd.DataFrame([
-                    ("Consignaciones / Apertura CDTs (Tope 4)", f"${res_exo['consignaciones_tope4']:,.0f}"),
-                    ("Saldos Cuentas Bancarias reportados", f"${res_exo['efectivo_bancos']:,.0f}"),
-                    ("Ingresos Trabajo / Servicios / Honorarios", f"${res_exo['ing_trabajo']:,.0f}"),
-                    ("Ingresos Capital (Rendimientos CDT)", f"${res_exo['ing_capital']:,.0f}"),
-                    ("Comp. Inflacionario CDT sugerido (Casilla 59)", f"${res_exo['incrngo_capital_sugerido']:,.0f}"),
-                    ("Aportes Salud/Pensión detectados", f"${res_exo['salud_pension']:,.0f}"),
-                    ("Retenciones en la Fuente (Casilla 132)", f"${res_exo['retenciones']:,.0f}"),
-                ], columns=["Concepto Exógena", "Total Detectado"])
+                    ("Saldos Cuentas Bancarias a dic 31", f"${res_exo['efectivo_bancos']:,.0f}"),
+                    ("Saldos CDT / Inversiones a dic 31", f"${res_exo['inversiones_cdt_saldo']:,.0f}"),
+                    ("Movimientos y Consignaciones (Tope 4)", f"${res_exo['consignaciones_tope4']:,.0f}"),
+                    ("Compras Totales (Tope 5)", f"${res_exo['compras_totales']:,.0f}"),
+                    ("Base Factura Electrónica susceptible 1% (C.28)", f"${res_exo['factura_electronica_1pct']:,.0f}"),
+                    ("Ingresos Salarios (C.32) + Servicios/Honorarios", f"${res_exo['ing_trabajo'] + res_exo['ing_honorarios']:,.0f}"),
+                    ("Ingresos Capital — Rendimientos CDT (C.58)", f"${res_exo['ing_capital']:,.0f}"),
+                    ("Comp. Inflacionario CDT sugerido (C.59)", f"${res_exo['incrngo_capital_sugerido']:,.0f}"),
+                    ("Retenciones Practicadas (C.132)", f"${res_exo['retenciones']:,.0f}"),
+                ], columns=["Concepto Tributario DIAN", "Valor Exacto"])
                 st.table(df_res_exo)
 
                 for nota in res_exo["notas"]:
-                    st.warning(f"📌 {nota}")
+                    st.info(f"📌 **Guía Contable:** {nota}")
 
                 if st.button("⚡ Pasar Valores de Exógena al Formulario (Editable)", type="primary", use_container_width=True):
+                    if res_exo["anio_detectado"]:
+                        st.session_state["anio_detectado_exo"] = res_exo["anio_detectado"]
                     if res_exo["nombre_detectado"]:
                         d["nombre_declarante"] = res_exo["nombre_detectado"]
                     if res_exo["nit_detectado"]:
                         d["nit_declarante"] = res_exo["nit_detectado"]
-                    if res_exo["efectivo_bancos"] > 0:
-                        d["efectivo"] = res_exo["efectivo_bancos"]
+                    d["efectivo"] = res_exo["efectivo_bancos"]
+                    d["otros_activos"] = res_exo["inversiones_cdt_saldo"]
                     if res_exo["inmuebles_vehiculos"] > 0:
                         d["inmuebles"] = res_exo["inmuebles_vehiculos"]
-                    if res_exo["deudas"] > 0:
-                        d["deudas"] = res_exo["deudas"]
-                    if res_exo["consignaciones_tope4"] > 0:
-                        d["consignaciones"] = res_exo["consignaciones_tope4"]
-                    if res_exo["tarjetas_credito"] > 0:
-                        d["tarjetas_credito"] = res_exo["tarjetas_credito"]
-                    if res_exo["compras_totales"] > 0:
-                        d["compras_totales"] = res_exo["compras_totales"]
-                    if res_exo["ing_trabajo"] > 0:
-                        d["ing_brutos_trabajo"] = res_exo["ing_trabajo"]
+                    d["deudas"] = res_exo["deudas"]
+                    d["consignaciones"] = res_exo["consignaciones_tope4"]
+                    d["tarjetas_credito"] = res_exo["tarjetas_credito"]
+                    d["compras_totales"] = res_exo["compras_totales"]
+                    d["compras_factura_electronica"] = res_exo["factura_electronica_1pct"]
+                    d["ing_brutos_trabajo"] = res_exo["ing_trabajo"]
+                    d["ing_brutos_honorarios"] = res_exo["ing_honorarios"]
+                    d["ing_brutos_no_laborales"] = res_exo["ing_no_laborales"]
                     if res_exo["salud_pension"] > 0:
                         d["salud_pension_trabajo"] = res_exo["salud_pension"]
-                    if res_exo["ing_capital"] > 0:
-                        d["ing_brutos_capital"] = res_exo["ing_capital"]
-                        d["incrngo_capital"] = res_exo["incrngo_capital_sugerido"]
-                    if res_exo["retenciones"] > 0:
-                        d["retenciones_anio"] = res_exo["retenciones"]
+                    d["ing_brutos_capital"] = res_exo["ing_capital"]
+                    d["incrngo_capital"] = res_exo["incrngo_capital_sugerido"]
+                    d["retenciones_anio"] = res_exo["retenciones"]
                     if res_exo["intereses_vivienda"] > 0:
                         d["intereses_vivienda"] = res_exo["intereses_vivienda"]
                     if res_exo["medicina_prepagada"] > 0:
                         d["medicina_prepagada"] = res_exo["medicina_prepagada"]
                     if res_exo["gmf_100"] > 0:
                         d["gmf_certificado_100"] = res_exo["gmf_100"]
-                    if res_exo["factura_electronica"] > 0:
-                        d["compras_factura_electronica"] = res_exo["factura_electronica"]
                     st.session_state.form_version += 1
                     st.rerun()
 
-                if st.button("🤖 Análisis Cualitativo Adicional con Gemini (Opcional)", use_container_width=True):
+                if st.button("🤖 Explicación Detallada de Terceros con Gemini (Opcional)", use_container_width=True):
                     if not api_key:
-                        st.error("Ingresa una Gemini API Key válida en la barra lateral o en Secrets.")
+                        st.error("Configura una Gemini API Key válida en Secrets o en la barra lateral.")
                     else:
                         try:
                             with st.spinner("Auditando terceros con Gemini..."):
@@ -1110,12 +1209,12 @@ with t1:
                 st.error(f"No se pudo procesar el archivo de Exógena: {e}")
 
         if st.session_state.auditoria_exogena:
-            st.info(st.session_state.auditoria_exogena)
+            st.success(st.session_state.auditoria_exogena)
 
     with col_der:
         st.subheader("📄 B. Lector IA de Certificados (PDF / Imagen)")
         up_doc = st.file_uploader(
-            "Sube Certificado 220, Certificado Tributario CDT, Extracto o Prepagada",
+            "Sube Certificado 220, Planilla PILA, Certificado CDT, Predial o Prepagada",
             type=["pdf", "png", "jpg", "jpeg"],
         )
         if up_doc and st.button("🔍 Extraer cifras del soporte con Gemini", type="primary", use_container_width=True):
@@ -1156,7 +1255,7 @@ with t1:
             up_macro = st.file_uploader("Sube 'PROGRAMA PARA DECLARAR RENTA.xlsm'", type=["xlsm", "xlsx"])
             if up_macro and st.button("⚡ Importar Hoja 'Ingreso_Datos' (C4:C20)", use_container_width=True):
                 try:
-                    migrados = importar_macro_xlsm(up_macro.getvalue())
+                    migrados = importar_macro_xlsm(up_macro.getvalue(), anio_gravable)
                     if "uvt_detectada" in migrados:
                         st.session_state["uvt_migrada"] = migrados.pop("uvt_detectada")
                     st.session_state.datos.update(migrados)
@@ -1170,22 +1269,22 @@ with t2:
     id1, id2, id3 = st.columns([2, 1, 1])
     d["nombre_declarante"] = id1.text_input("Nombre Completo del Declarante (Casillas 7-10)", value=d["nombre_declarante"], key=f"nom_{v}")
     d["nit_declarante"] = id2.text_input("Cédula / NIT sin DV (Casilla 5)", value=d["nit_declarante"], key=f"nit_{v}")
-    d["cod_actividad"] = id3.text_input("Código Actividad CIIU (Casilla 24)", value=d["cod_actividad"], help="Ej: 0010 Asalariado, 8211 Servicios Administrativos, 0090 Rentista Capital", key=f"ciiu_{v}")
+    d["cod_actividad"] = id3.text_input("Código Actividad CIIU (Casilla 24)", value=d["cod_actividad"], key=f"ciiu_{v}")
 
     st.divider()
     p1, p2 = st.columns(2)
     with p1:
         st.subheader("Patrimonio a 31 de Diciembre (Casillas 29 a 31)")
         d["efectivo"] = st.number_input("Saldos en Bancos, Ahorros, Nequi, Daviplata, Efectivo", min_value=0.0, value=float(d["efectivo"]), step=100_000.0, key=f"ef_{v}")
-        d["otros_activos"] = st.number_input("CDTs vigentes a dic 31, Fondos, Acciones, Cuentas por Cobrar", min_value=0.0, value=float(d["otros_activos"]), step=200_000.0, key=f"ot_{v}")
+        d["otros_activos"] = st.number_input("Saldos CDTs vigentes a dic 31, Fondos, Acciones", min_value=0.0, value=float(d["otros_activos"]), step=200_000.0, key=f"ot_{v}")
         d["inmuebles"] = st.number_input("Bienes Raíces: Lotes, Casas, Apartamentos (Mayor entre costo y predial)", min_value=0.0, value=float(d["inmuebles"]), step=1_000_000.0, key=f"inm_{v}")
         d["vehiculos"] = st.number_input("Vehículos, Motocicletas y Otros Bienes", min_value=0.0, value=float(d["vehiculos"]), step=500_000.0, key=f"ve_{v}")
         d["deudas"] = st.number_input("Deudas y Pasivos Vigentes a dic 31 (Casilla 30)", min_value=0.0, value=float(d["deudas"]), step=200_000.0, key=f"deu_{v}")
     with p2:
         st.subheader("Verificación de los 6 Topes DIAN y Control Patrimonial")
-        d["consignaciones"] = st.number_input("Consignaciones e Inversiones Acumuladas en el Año", min_value=0.0, value=float(d["consignaciones"]), step=500_000.0, key=f"con_{v}")
-        d["tarjetas_credito"] = st.number_input("Consumos con Tarjeta de Crédito en el Año", min_value=0.0, value=float(d["tarjetas_credito"]), step=500_000.0, key=f"tc_{v}")
-        d["compras_totales"] = st.number_input("Compras y Consumos Totales en el Año", min_value=0.0, value=float(d["compras_totales"]), step=500_000.0, key=f"com_{v}")
+        d["consignaciones"] = st.number_input("Consignaciones e Inversiones Acumuladas (Tope 4)", min_value=0.0, value=float(d["consignaciones"]), step=500_000.0, key=f"con_{v}")
+        d["tarjetas_credito"] = st.number_input("Consumos con Tarjeta de Crédito (Tope 3)", min_value=0.0, value=float(d["tarjetas_credito"]), step=500_000.0, key=f"tc_{v}")
+        d["compras_totales"] = st.number_input("Compras y Consumos Totales (Tope 5)", min_value=0.0, value=float(d["compras_totales"]), step=500_000.0, key=f"com_{v}")
         d["responsable_iva"] = st.toggle("¿Responsable de IVA a 31 de diciembre?", value=bool(d["responsable_iva"]), key=f"iva_{v}")
         st.divider()
         d["patrimonio_liquido_anterior"] = st.number_input("Patrimonio Líquido Declaración Año Anterior (Auditoría Art. 236 E.T.)", min_value=0.0, value=float(d["patrimonio_liquido_anterior"]), step=500_000.0, key=f"pat_ant_{v}")
@@ -1194,12 +1293,12 @@ with t2:
 with t3:
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.subheader("Trabajo y Honorarios")
-        d["ing_brutos_trabajo"] = st.number_input("Ingresos Rentas de Trabajo / Salarios (Casilla 32)", min_value=0.0, value=float(d["ing_brutos_trabajo"]), step=200_000.0, key=f"itr_{v}")
-        d["salud_pension_trabajo"] = st.number_input("Salud + Pensión Obligatoria Trabajo (Casilla 33)", min_value=0.0, value=float(d["salud_pension_trabajo"]), step=50_000.0, key=f"sp_{v}")
+        st.subheader("Trabajo, Servicios y Honorarios")
+        d["ing_brutos_trabajo"] = st.number_input("Salarios / Ingresos Laborales (Casilla 32)", min_value=0.0, value=float(d["ing_brutos_trabajo"]), step=200_000.0, key=f"itr_{v}")
+        d["salud_pension_trabajo"] = st.number_input("Salud + Pensión Obligatoria Salarios", min_value=0.0, value=float(d["salud_pension_trabajo"]), step=50_000.0, key=f"sp_{v}")
         st.divider()
-        d["ing_brutos_honorarios"] = st.number_input("Honorarios / Servicios Independientes (Casilla 43)", min_value=0.0, value=float(d["ing_brutos_honorarios"]), step=200_000.0, key=f"ihon_{v}")
-        d["salud_pension_honorarios"] = st.number_input("Salud + Pensión Obligatoria Honorarios (Casilla 44)", min_value=0.0, value=float(d["salud_pension_honorarios"]), step=50_000.0, key=f"sphon_{v}")
+        d["ing_brutos_honorarios"] = st.number_input("Servicios / Honorarios Independientes", min_value=0.0, value=float(d["ing_brutos_honorarios"]), step=200_000.0, help="El motor los ubica automáticamente en Casilla 32 (si conviene el 25% exento) o en Casilla 43 (si tus costos son mayores).", key=f"ihon_{v}")
+        d["salud_pension_honorarios"] = st.number_input("Aportes PILA Salud + Pensión Independiente", min_value=0.0, value=float(d["salud_pension_honorarios"]), step=50_000.0, key=f"sphon_{v}")
         d["costos_honorarios"] = st.number_input("Costos/Gastos de Honorarios (Casilla 45 — Simula vs 25%)", min_value=0.0, value=float(d["costos_honorarios"]), step=100_000.0, key=f"chon_{v}")
 
     with c2:
@@ -1208,7 +1307,7 @@ with t3:
         d["incrngo_capital"] = st.number_input("Componente Inflacionario CDT — No Gravado (Casilla 59)", min_value=0.0, value=float(d["incrngo_capital"]), step=50_000.0, key=f"inccap_{v}")
         if d["ing_brutos_capital"] > 0:
             pct_sug = COMP_INFLACIONARIO_HISTORICO.get(anio_gravable, 0.5544)
-            if st.button(f"✨ Calcular Comp. Inflacionario ({pct_sug*100:.2f}%)", use_container_width=True):
+            if st.button(f"✨ Recalcular Comp. Inflacionario ({pct_sug*100:.2f}%)", use_container_width=True):
                 d["incrngo_capital"] = float(redondear_dian(d["ing_brutos_capital"] * pct_sug))
                 st.session_state.form_version += 1
                 st.rerun()
@@ -1229,7 +1328,8 @@ with t3:
     with c3:
         st.subheader("Beneficios Ley 2277 y Retenciones")
         d["num_dependientes"] = st.number_input("Número de Dependientes Económicos (Casilla 138)", min_value=0, max_value=10, value=int(d["num_dependientes"]), step=1, key=f"dep_{v}")
-        d["compras_factura_electronica"] = st.number_input("Compras con Factura Electrónica + Pago Digital (Base Casilla 28)", min_value=0.0, value=float(d["compras_factura_electronica"]), step=200_000.0, key=f"fe_{v}")
+        d["compras_factura_electronica"] = st.number_input("Base Compras Factura Electrónica (Susceptible 1%)", min_value=0.0, value=float(d["compras_factura_electronica"]), step=100_000.0, key=f"fe_{v}")
+        d["aplicar_beneficio_fe"] = st.toggle("✅ Aplicar 1% Factura Electrónica en Casilla 28 (Si pagaste con tarjeta/transferencia)", value=bool(d["aplicar_beneficio_fe"]), key=f"apfe_{v}")
         d["intereses_vivienda"] = st.number_input("Intereses Crédito Vivienda (Casilla 38)", min_value=0.0, value=float(d["intereses_vivienda"]), step=100_000.0, key=f"viv_{v}")
         d["medicina_prepagada"] = st.number_input("Medicina Prepagada / Póliza Salud (Casilla 39)", min_value=0.0, value=float(d["medicina_prepagada"]), step=100_000.0, key=f"prep_{v}")
         d["gmf_certificado_100"] = st.number_input("GMF 4x1000 (Ingresa el 100% certificado)", min_value=0.0, value=float(d["gmf_certificado_100"]), step=20_000.0, key=f"gmf_{v}")
@@ -1268,11 +1368,9 @@ with t4:
     for al in res["alertas_auditoria"]:
         st.error(f"🚨 {al}")
     for sg in res["sugerencias_optimizacion"]:
-        st.info(f"💡 **Oportunidad de Ahorro:** {sg}")
+        st.info(f"💡 **Aviso Inteligente:** {sg}")
 
     st.subheader(f"Borrador Oficial Casilla por Casilla — Formulario 210 DIAN (AG {anio_gravable})")
-    st.caption("Cada número de casilla coincide exactamente con el formulario en el portal Muisca de la DIAN.")
-
     filas_vista = construir_filas_210(res)
     df_vista = pd.DataFrame(
         [
@@ -1302,14 +1400,14 @@ with t4:
         use_container_width=True,
     )
 
-# PESTAÑA 5: CONSULTOR TRIBUTARIO IA (CONECTADO AL FORMULARIO 210)
+# PESTAÑA 5: CONSULTOR TRIBUTARIO IA
 with t5:
     st.subheader("⚖️ Estratega Tributario con Gemini (Conectado a tus Casillas 210)")
     for msj in st.session_state.chat_mensajes:
         with st.chat_message(msj["role"]):
             st.markdown(msj["content"])
 
-    consulta = st.chat_input("Ej: ¿Por qué las consignaciones me obligan a declarar pero mi impuesto da $0?")
+    consulta = st.chat_input("Ej: ¿Por qué mis consignaciones de $142M me obligan a declarar pero mi impuesto es $0?")
     if consulta:
         if not api_key:
             st.error("Configura una Gemini API Key válida en la barra lateral o en Secrets.")
