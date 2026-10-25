@@ -27,7 +27,11 @@ try:
 except Exception:
     OCR_DISPONIBLE = False
 
-st.set_page_config(page_title="RentaIA Pro | Formulario 210 DIAN", page_icon="📊", layout="wide")
+st.set_page_config(
+    page_title="RentaIA Pro | Formulario 210 DIAN",
+    page_icon="📊",
+    layout="wide",
+)
 
 # ==============================================================================
 # 1. PARÁMETROS NORMATIVOS DIAN MULTIAÑO (FUNCIONA PARA CUALQUIER AÑO FUTURO)
@@ -67,6 +71,15 @@ TABLA_ART_241 = [
     (31_000, float("inf"), 0.39, 10_352),
 ]
 
+MODELOS_PREFERIDOS_GEMINI = [
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-flash-latest",
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash",
+]
+
 
 def uvt_por_anio(anio: int) -> int:
     return UVT_OFICIAL.get(anio, UVT_OFICIAL[max(UVT_OFICIAL.keys())])
@@ -89,10 +102,10 @@ def calcular_dv(nit_str: str) -> str:
 
 
 # ==============================================================================
-# 2. SEGURIDAD Y CONEXIÓN GEMINI INTELIGENTE ('AIza...' + 'AQ....' SIN BLOQUEOS)
+# 2. SEGURIDAD Y CONEXIÓN GEMINI INTELIGENTE ('AIza...' + 'AQ....' + GEMINI 3.x)
 # ==============================================================================
 def limpiar_key(raw: str) -> str:
-    """Acepta claves estándar de Google AI Studio (AIza...) y claves Vertex Express (AQ....)."""
+    """Acepta claves estándar (AIza...) y nuevas Auth Keys de AI Studio / Vertex (AQ....)."""
     if not raw:
         return ""
     txt = str(raw).strip()
@@ -114,7 +127,11 @@ def obtener_secreto(nombre: str) -> str:
 
 
 def generar_licencia(identificador: str, semilla: str) -> str:
-    h = hmac.new(semilla.encode("utf-8"), identificador.strip().upper().encode("utf-8"), hashlib.sha256).hexdigest()
+    h = hmac.new(
+        semilla.encode("utf-8"),
+        identificador.strip().upper().encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
     return f"RENTA-{h[:12].upper()}"
 
 
@@ -145,20 +162,53 @@ def verificar_acceso() -> bool:
 
 
 def crear_clientes_gemini(llave: str) -> List[Tuple[str, Any]]:
-    """Construye los clientes compatibles sin abortar antes de probar alternativas."""
-    clientes = []
+    """
+    Google AI Studio ahora también emite claves con prefijo 'AQ.'.
+    Por ello se prioriza AIStudio primero y se deja VertexAI como respaldo automático.
+    """
+    clientes: List[Tuple[str, Any]] = []
+    try:
+        clientes.append(("AIStudio", genai.Client(api_key=llave)))
+    except Exception:
+        pass
     if llave.startswith("AQ."):
         try:
             clientes.append(("VertexAI", genai.Client(vertexai=True, api_key=llave)))
         except Exception:
             pass
-        try:
-            clientes.append(("AIStudio", genai.Client(api_key=llave)))
-        except Exception:
-            pass
-    else:
-        clientes.append(("AIStudio", genai.Client(api_key=llave)))
     return clientes
+
+
+def _descubrir_modelos_activos(cli: Any, ya_probados: List[str]) -> List[str]:
+    """Si los modelos fijos dan 404 en el futuro, descubre dinámicamente los modelos activos de la cuenta."""
+    excluidos = ("tts", "live", "image", "embed", "veo", "lyria", "robotics", "aqa", "imagen", "audio")
+    hallados: List[str] = []
+    try:
+        for m in cli.models.list():
+            nom = str(getattr(m, "name", "") or "").replace("models/", "").strip()
+            acciones = getattr(m, "supported_actions", None) or []
+            if not nom or nom in ya_probados:
+                continue
+            if "gemini" not in nom.lower() or any(x in nom.lower() for x in excluidos):
+                continue
+            if acciones and "generateContent" not in acciones:
+                continue
+            hallados.append(nom)
+    except Exception:
+        return []
+    hallados.sort(key=lambda x: (0 if "flash" in x.lower() else 1, x), reverse=False)
+    return hallados[:4]
+
+
+def _construir_config_gemini(modelo: str, system_instruction: str = None, temperatura: float = 0.0) -> types.GenerateContentConfig:
+    """Omite 'temperature' en modelos Gemini 3.x / alias latest donde el parámetro fue deprecado."""
+    cfg_kwargs: Dict[str, Any] = {}
+    if system_instruction:
+        cfg_kwargs["system_instruction"] = system_instruction
+    es_serie_3 = modelo.startswith("gemini-3") or modelo.endswith("-latest")
+    if not es_serie_3 and temperatura is not None:
+        cfg_kwargs["temperature"] = temperatura
+    return types.GenerateContentConfig(**cfg_kwargs)
 
 
 def llamar_gemini(
@@ -167,7 +217,7 @@ def llamar_gemini(
     system_instruction: str = None,
     temperatura: float = 0.0,
 ) -> str:
-    """Consulta Gemini con modelos 2026 vigentes, detección de cuota agotada y fallback real entre clientes."""
+    """Consulta Gemini con modelos 3.x vigentes, auto-descubrimiento anti-404 y fallback AIStudio/Vertex."""
     llave = limpiar_key(api_key)
     if not llave:
         raise ValueError(
@@ -178,20 +228,22 @@ def llamar_gemini(
     if not clientes:
         raise RuntimeError("No se pudo inicializar el cliente de Gemini. Revisa la clave configurada.")
 
-    cfg_kwargs: Dict[str, Any] = {"temperature": temperatura}
-    if system_instruction:
-        cfg_kwargs["system_instruction"] = system_instruction
-    config = types.GenerateContentConfig(**cfg_kwargs)
-
-    modelos = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
     ultimo_err = None
     errores_modelos = []
 
     for nombre_cli, cli in clientes:
         abortar_este_cliente = False
-        for mod in modelos:
+        modelos_cola = list(MODELOS_PREFERIDOS_GEMINI)
+        descubrimiento_hecho = False
+        idx_m = 0
+
+        while idx_m < len(modelos_cola):
             if abortar_este_cliente:
                 break
+            mod = modelos_cola[idx_m]
+            idx_m += 1
+            config = _construir_config_gemini(mod, system_instruction=system_instruction, temperatura=temperatura)
+
             for intento in range(3):
                 try:
                     respuesta = cli.models.generate_content(model=mod, contents=contents, config=config)
@@ -209,27 +261,29 @@ def llamar_gemini(
                             "quota_exceeded", "daily limit", "limit: 0", "billing", "generaterequestsperday"
                         )
                         if any(p in detalle for p in indicadores_cuota):
-                            raise RuntimeError(
-                                "CUOTA_GEMINI_AGOTADA: Google reporta cuota diaria/proyecto agotada. "
-                                "Usa el botón 'Extraer SIN IA' o espera a que se restablezca la cuota."
-                            ) from e
+                            errores_modelos.append(f"{nombre_cli}/{mod}: cuota agotada en este modelo")
+                            break
                         if intento < 2:
-                            time.sleep((3, 6)[intento])
+                            time.sleep((2, 5)[intento])
                             continue
                         errores_modelos.append(f"{nombre_cli}/{mod}: HTTP 429 (límite por minuto)")
                         break
 
                     if codigo in (401, 403):
-                        errores_modelos.append(f"{nombre_cli}/{mod}: HTTP {codigo} (permisos/autenticación)")
+                        errores_modelos.append(f"{nombre_cli}/{mod}: HTTP {codigo} (permisos/superficie)")
                         abortar_este_cliente = True
+                        break
+
+                    if codigo == 404:
+                        errores_modelos.append(f"{nombre_cli}/{mod}: HTTP 404 (no disponible)")
+                        if idx_m == len(modelos_cola) and not descubrimiento_hecho:
+                            descubrimiento_hecho = True
+                            nuevos = _descubrir_modelos_activos(cli, modelos_cola)
+                            modelos_cola.extend(nuevos)
                         break
 
                     if codigo == 400:
                         errores_modelos.append(f"{nombre_cli}/{mod}: HTTP 400 ({str(e)[:120]})")
-                        break
-
-                    if codigo == 404:
-                        errores_modelos.append(f"{nombre_cli}/{mod}: HTTP 404 (modelo no disponible)")
                         break
 
                     if codigo is not None and codigo >= 500 and intento < 2:
@@ -245,14 +299,12 @@ def llamar_gemini(
                         continue
                     errores_modelos.append(f"{nombre_cli}/{mod}: error de red ({e})")
                     break
-                except RuntimeError:
-                    raise
                 except Exception as e:
                     ultimo_err = e
                     errores_modelos.append(f"{nombre_cli}/{mod}: {type(e).__name__}: {str(e)[:120]}")
                     break
 
-    resumen_err = " | ".join(errores_modelos) or str(ultimo_err)
+    resumen_err = " | ".join(errores_modelos[-6:]) or str(ultimo_err)
     raise RuntimeError(f"No se pudo completar la consulta a Gemini. Detalle técnico: {resumen_err}") from ultimo_err
 
 
@@ -307,8 +359,14 @@ def liquidar_210(d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, 
     c77 = min(neto_nl, redondear_dian(d["costos_no_laborales"]))
     c78 = max(0, neto_nl - c77)
 
-    trab_bruto_tot = redondear_dian(d["ing_brutos_trabajo"]) + redondear_dian(d["ing_brutos_honorarios"])
-    inc_trab_tot = min(trab_bruto_tot, redondear_dian(d["salud_pension_trabajo"]) + redondear_dian(d["salud_pension_honorarios"]))
+    # Art. 55 y 56 E.T. + Concepto Unificado DIAN 0912 de 2018 (Descriptor 1.12):
+    # Los aportes obligatorios de EPS (Salud) + Pensión + ARL pagados por el independiente
+    # son Ingresos No Constitutivos de Renta (INCRNGO) y se suman antes de redondear la casilla.
+    trab_bruto_tot = redondear_dian(d["ing_brutos_trabajo"] + d["ing_brutos_honorarios"])
+    inc_trab_tot = min(
+        trab_bruto_tot,
+        redondear_dian(d["salud_pension_trabajo"] + d["salud_pension_honorarios"] + d["arl_honorarios"]),
+    )
     ing_brutos_cg = trab_bruto_tot + c58 + c74
     ing_netos_cg = max(0, trab_bruto_tot - inc_trab_tot) + neto_cap + neto_nl
     hay_trab = trab_bruto_tot > 0
@@ -319,25 +377,30 @@ def liquidar_210(d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, 
     ded_ice = redondear_dian(min(d["intereses_icetex"], 100 * uvt))
     ded_gmf = redondear_dian(d["gmf_certificado_100"] * 0.50)
     c39 = ded_prep + ded_dep10 + ded_ice + ded_gmf
+    c40 = c38 + c39
     c35 = redondear_dian(min(d["aportes_afc_fpv"], ing_brutos_cg * 0.30, 3_800 * uvt))
     ces_ex = redondear_dian(d["cesantias_exentas"])
 
-    ded_comunes = c38 + c39 + c35 + ces_ex
+    ded_comunes = c40 + c35 + ces_ex
     lim_40 = redondear_dian(min(ing_netos_cg * 0.40, 1_340 * uvt))
     tope_790 = 790 * uvt
 
+    # Estrategia A: Rentas de Trabajo con 25% Exento (Casillas 32-42)
     c34_a = max(0, trab_bruto_tot - inc_trab_tot)
     c91_a = c34_a + c61 + c78
     ex25_a = redondear_dian(min(max(0, c34_a - ded_comunes) * 0.25, tope_790))
     acep_a = min(ded_comunes + ex25_a, lim_40, c91_a)
     rem_a = max(0, c91_a - acep_a)
 
-    cost_hon = redondear_dian(d["costos_honorarios"] + d["arl_honorarios"])
+    # Estrategia B: Honorarios sujetos a costos y gastos procedentes (Casillas 43-46)
+    cost_hon = redondear_dian(d["costos_honorarios"])
     c32_b = redondear_dian(d["ing_brutos_trabajo"])
     c33_b = min(c32_b, redondear_dian(d["salud_pension_trabajo"]))
     c34_b = max(0, c32_b - c33_b)
     c43_b = redondear_dian(d["ing_brutos_honorarios"])
-    pila_hon = redondear_dian(d["salud_pension_honorarios"]) + max(0, redondear_dian(d["salud_pension_trabajo"]) - c33_b)
+    pila_hon = redondear_dian(d["salud_pension_honorarios"] + d["arl_honorarios"]) + max(
+        0, redondear_dian(d["salud_pension_trabajo"]) - c33_b
+    )
     c44_b = min(c43_b, pila_hon)
     neto_h_b = max(0, c43_b - c44_b)
     c45_b = min(neto_h_b, cost_hon)
@@ -348,7 +411,7 @@ def liquidar_210(d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, 
     rem_b = max(0, c91_b - acep_b)
 
     if cost_hon > 0 and c43_b > 0 and rem_b < rem_a:
-        estrategia = "Honorarios con Costos + ARL (Casillas 43-46)"
+        estrategia = "Honorarios con Costos y Gastos (Casillas 43-46)"
         c32, c33, c34 = c32_b, c33_b, c34_b
         c43, c44, c45, c46 = c43_b, c44_b, c45_b, c46_b
         c91, c36, ben_40, sol_40, rem_cg = c91_b, ex25_b + ces_ex, acep_b, ded_comunes + ex25_b, rem_b
@@ -358,13 +421,18 @@ def liquidar_210(d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, 
         c43, c44, c45, c46 = 0, 0, 0, 0
         c91, c36, ben_40, sol_40, rem_cg = c91_a, ex25_a + ces_ex, acep_a, ded_comunes + ex25_a, rem_a
 
+    c37 = c35 + c36
+    c41 = min(c34, ben_40)
+    c42 = max(0, c34 - c41)
+
     fe_pot = redondear_dian(min(d["compras_factura_electronica"] * 0.01, 240 * uvt))
     c28 = fe_pot if d["aplicar_beneficio_fe"] else 0
     c139 = redondear_dian(min(int(d["num_dependientes"]), 4) * 72 * uvt) if hay_trab else 0
     fuera_40 = min(rem_cg, c28 + c139)
 
     c92 = ben_40 + fuera_40
-    c97 = max(0, c91 - c92)
+    c93 = max(0, c91 - c92)
+    c97 = c93
 
     c99 = redondear_dian(d["ing_brutos_pensiones"])
     c100 = min(c99, redondear_dian(d["salud_pensiones"]))
@@ -441,20 +509,22 @@ def liquidar_210(d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, 
         dif_p = redondear_dian((c31 - pat_ant) - (ing_netos_cg + pen_liq + c115 - imp_ant))
         alertas.append(f"Comparación Patrimonial (Art. 236 E.T.): Patrimonio creció ${dif_p:,.0f} por encima de ingresos netos.")
     if hay_trab and inc_trab_tot == 0:
-        sugerencias.append("Recuerda cargar tus planillas PILA en el Paso 1 o digitar Salud y Pensión en el Paso 3.")
+        sugerencias.append("Recuerda cargar tus planillas PILA en el Paso 1 o digitar EPS, Pensión y ARL en el Paso 3.")
     if fe_pot > 0 and not d["aplicar_beneficio_fe"]:
         sugerencias.append(f"Puedes restar ${fe_pot:,.0f} adicionales en Casilla 28 (1% Factura Electrónica) activándolo en el Paso 4.")
 
     return {
-        "obligado": len(causales) > 0, "estado": "Sí obligado a declarar" if causales else "No obligado a declarar",
+        "obligado": len(causales) > 0,
+        "estado": "Sí obligado a declarar" if causales else "No obligado a declarar",
         "causales": causales, "estrategia": estrategia, "rem_25": rem_a, "rem_costos": rem_b,
         "lim_40": lim_40, "usado_40": ben_40, "libre_40": max(0, lim_40 - sol_40),
         "ing_tot": ing_tot, "t_pat": t_pat, "t_ing": t_ing, "alivios": alivios,
         "rlg_uvt": round(c111 / uvt, 2) if uvt > 0 else 0, "alertas": alertas, "sugerencias": sugerencias,
         "c28": c28, "c29": c29, "c30": c30, "c31": c31, "c32": c32, "c33": c33, "c34": c34, "c35": c35,
-        "c36": c36, "c38": c38, "c39": c39, "c43": c43, "c44": c44, "c45": c45, "c46": c46, "c58": c58,
+        "c36": c36, "c37": c37, "c38": c38, "c39": c39, "c40": c40, "c41": c41, "c42": c42,
+        "c43": c43, "c44": c44, "c45": c45, "c46": c46, "c58": c58,
         "c59": c59, "c60": c60, "c61": c61, "c74": c74, "c76": c76, "c77": c77, "c78": c78, "c91": c91,
-        "c92": c92, "c97": c97, "c99": c99, "c100": c100, "c102": c102, "c103": c103, "c107": c107,
+        "c92": c92, "c93": c93, "c97": c97, "c99": c99, "c100": c100, "c102": c102, "c103": c103, "c107": c107,
         "c111": c111, "c112": c112, "c113": c113, "c114": c114, "c115": c115, "c116": c116, "c125": c125,
         "c126": c126, "c127": c127, "c129": c129, "c130": c130, "c131": c131, "c132": c132, "c133": c133,
         "c134": c134, "c135": c135, "c136": c136, "c137": c137, "c138": int(d["num_dependientes"]), "c139": c139,
@@ -514,7 +584,7 @@ def validar_archivo_soporte(nombre: str, b: bytes, mime: str) -> None:
 
 
 def extraer_texto_hibrido(b: bytes, mime: str) -> str:
-    """Extrae texto nativo del PDF o aplica OCR local si es escaneado/imagen (evita enviar binarios pesados)."""
+    """Extrae texto nativo del PDF o aplica OCR local si es escaneado/imagen."""
     if mime == "application/pdf":
         try:
             lector = pypdf.PdfReader(io.BytesIO(b))
@@ -592,7 +662,9 @@ def extraer_soporte_nativo_sin_ia(nombre: str, b: bytes, mime: str) -> dict:
 
     res = {
         "archivo": nombre,
-        "tipo_documento": "Formulario 220" if es_220 else ("Certificado CDT" if es_cdt else ("Predial" if es_predial else "Certificado Tributario")),
+        "tipo_documento": (
+            "Formulario 220" if es_220 else ("Certificado CDT" if es_cdt else ("Predial" if es_predial else "Certificado Tributario"))
+        ),
         "entidad": entidad,
     }
     for c in CAMPOS_SOPORTE:
@@ -628,7 +700,7 @@ def extraer_soporte_nativo_sin_ia(nombre: str, b: bytes, mime: str) -> dict:
 
 
 def extraer_pendientes_con_ia(api_key: str, pendientes: List[Tuple[Any, bytes, str]]) -> List[dict]:
-    """Envía solo los certificados nuevos en 1 SOLA consulta ligera (compatible con Vertex 'AQ.' y 'AIza')."""
+    """Envía solo los certificados nuevos en 1 SOLA consulta ligera."""
     bloques_texto = []
     partes_visuales: List[Any] = []
 
@@ -859,15 +931,19 @@ def filas_formulario_210(r: dict) -> List[Tuple[str, str, int]]:
         ("30", "Deudas", r["c30"]),
         ("31", "Total patrimonio líquido (29 - 30)", r["c31"]),
         ("32", "Ingresos brutos Rentas de Trabajo (Salarios / Servicios con 25% exento)", r["c32"]),
-        ("33", "Ingresos no constitutivos Trabajo (Salud + Pensión)", r["c33"]),
+        ("33", "Ingresos no constitutivos Trabajo (EPS Salud + Pensión + ARL Independiente)", r["c33"]),
         ("34", "Renta líquida Trabajo (32 - 33)", r["c34"]),
         ("35", "Aportes voluntarios AFC, FVP y/o AVC", r["c35"]),
         ("36", "Otras rentas exentas Trabajo (25% laboral + Cesantías)", r["c36"]),
+        ("37", "Total rentas exentas Trabajo (35 + 36)", r["c37"]),
         ("38", "Intereses de vivienda", r["c38"]),
         ("39", "Otras deducciones Trabajo (Prepagada, 10% dep., ICETEX, 50% GMF)", r["c39"]),
+        ("40", "Total deducciones imputables Trabajo (38 + 39)", r["c40"]),
+        ("41", "Rentas exentas y/o deducciones imputables limitadas Trabajo", r["c41"]),
+        ("42", "Renta líquida ordinaria Trabajo (34 - 41)", r["c42"]),
         ("43", "Ingresos brutos Honorarios sujetos a costos", r["c43"]),
-        ("44", "Ingresos no constitutivos Honorarios (Salud + Pensión)", r["c44"]),
-        ("45", "Costos y deducciones procedentes Honorarios (Incluye ARL)", r["c45"]),
+        ("44", "Ingresos no constitutivos Honorarios (EPS Salud + Pensión + ARL)", r["c44"]),
+        ("45", "Costos y deducciones procedentes Honorarios", r["c45"]),
         ("46", "Renta líquida Honorarios (43 - 44 - 45)", r["c46"]),
         ("58", "Ingresos brutos Rentas de Capital (CDT / Intereses / Arriendos)", r["c58"]),
         ("59", "Ingresos no constitutivos Capital (Componente Inflacionario CDT)", r["c59"]),
@@ -879,7 +955,8 @@ def filas_formulario_210(r: dict) -> List[Tuple[str, str, int]]:
         ("78", "Renta líquida No Laborales", r["c78"]),
         ("91", "Renta líquida Cédula General (34 + 46 + 61 + 78)", r["c91"]),
         ("92", "Rentas exentas y deducciones imputables limitadas", r["c92"]),
-        ("97", "Renta líquida gravable Cédula General (91 - 92)", r["c97"]),
+        ("93", "Renta líquida ordinaria Cédula General (91 - 92)", r["c93"]),
+        ("97", "Renta líquida gravable Cédula General", r["c97"]),
         ("99", "Ingresos brutos por pensiones", r["c99"]),
         ("100", "Ingresos no constitutivos pensiones (Salud)", r["c100"]),
         ("102", "Rentas exentas de pensiones", r["c102"]),
@@ -918,7 +995,7 @@ def generar_excel(r: dict, d: dict, anio: int, df_pila: pd.DataFrame = None) -> 
             df_pila.to_excel(writer, index=False, sheet_name="Detalle_PILA")
         ws = writer.sheets[hoja]
         ws.column_dimensions["A"].width = 12
-        ws.column_dimensions["B"].width = 65
+        ws.column_dimensions["B"].width = 68
         ws.column_dimensions["C"].width = 22
         h_fill = PatternFill(start_color="1B365D", end_color="1B365D", fill_type="solid")
         k_fill = PatternFill(start_color="E8F4EA", end_color="E8F4EA", fill_type="solid")
@@ -946,14 +1023,17 @@ def generar_word(r: dict, d: dict, anio: int, uvt: float) -> bytes:
     doc.add_heading("Casillas Principales Formulario 210 DIAN", level=2)
     for cas, nom, val in filas_formulario_210(r):
         if val > 0 or cas in ("29", "31", "97", "111", "129", "132", "136", "137"):
-            doc.add_paragraph(f"Casilla {cas} — {nom}: {'' if cas == '138' else '$'}{val:,.0f}", style="List Bullet")
+            doc.add_paragraph(
+                f"Casilla {cas} — {nom}: {'' if cas == '138' else '$'}{val:,.0f}",
+                style="List Bullet",
+            )
     out = io.BytesIO()
     doc.save(out)
     return out.getvalue()
 
 
 # ==============================================================================
-# 6. INTERFAZ PRINCIPAL BLINDADA (v5.4 FUSIÓN PRO)
+# 6. INTERFAZ PRINCIPAL BLINDADA (v5.5 FUSIÓN PRO)
 # ==============================================================================
 if not verificar_acceso():
     st.stop()
@@ -987,12 +1067,12 @@ d = st.session_state.datos
 
 with st.sidebar:
     st.title("⚙️ Configuración DIAN")
-    st.caption("Versión **v5.4 Fusión Pro** • Caché SHA-256 + Lote IA + Respaldo Local")
+    st.caption("Versión **v5.5 Fusión Pro** • Gemini 3.x + Caché SHA-256 + MUISCA Exacto")
 
     sec_key = obtener_secreto("GEMINI_API_KEY")
     if sec_key:
         api_key = sec_key
-        modo_txt = "Vertex AI" if sec_key.startswith("AQ.") else "AI Studio"
+        modo_txt = "Auth Key (AQ.)" if sec_key.startswith("AQ.") else "API Key (AIza)"
         st.success(f"🔒 Gemini conectada — {modo_txt} ({sec_key[:3]}...{sec_key[-4:]})")
     else:
         st.warning("⚠️ Sin clave en Secrets. Pégala abajo si vas a usar IA:")
@@ -1013,7 +1093,10 @@ with st.sidebar:
 
     uvt_def = st.session_state.uvt_map.get(anio_gravable, uvt_por_anio(anio_gravable))
     valor_uvt = int(
-        st.number_input(f"Valor UVT AG {anio_gravable} ($ COP)", min_value=10_000, value=int(uvt_def), step=100, key=f"w_uvt_{anio_gravable}_{fid}")
+        st.number_input(
+            f"Valor UVT AG {anio_gravable} ($ COP)",
+            min_value=10_000, value=int(uvt_def), step=100, key=f"w_uvt_{anio_gravable}_{fid}",
+        )
     )
     st.session_state.uvt_map[anio_gravable] = valor_uvt
 
@@ -1025,7 +1108,12 @@ with st.sidebar:
     d["anio_declara_num"] = st.selectbox(
         "Anticipo Año Siguiente (Casilla 133)",
         options=[0, 1, 2, 3], index=int(d["anio_declara_num"]),
-        format_func=lambda x: {0: "Sin Anticipo ($0)", 1: "1er Año (25%)", 2: "2do Año (50%)", 3: "3er Año+ (75% Optimizado)"}[x],
+        format_func=lambda x: {
+            0: "Sin Anticipo ($0)",
+            1: "1er Año (25%)",
+            2: "2do Año (50%)",
+            3: "3er Año+ (75% Optimizado)",
+        }[x],
     )
 
     with st.expander("💾 Guardar / Abrir Cliente (.json)"):
@@ -1067,7 +1155,10 @@ with st.sidebar:
             st.rerun()
 
 st.title(f"📊 RentaIA Pro — Liquidador & Auditor Formulario 210 (AG {anio_gravable})")
-st.caption(f"Año Gravable **{anio_gravable}** (Presentación en **{anio_gravable + 1}**) • UVT: **${valor_uvt:,.0f}** • Memoria Privada RAM")
+st.caption(
+    f"Año Gravable **{anio_gravable}** (Presentación en **{anio_gravable + 1}**) • "
+    f"UVT: **${valor_uvt:,.0f}** • Memoria Privada RAM"
+)
 
 if st.session_state.toast_ok:
     st.success(st.session_state.toast_ok)
@@ -1091,7 +1182,10 @@ with t1:
 
     with c_izq:
         st.subheader("📊 A. Información Exógena DIAN (.xlsx)")
-        f_exo = st.file_uploader("Sube el Excel descargado de la DIAN (No requiere IA)", type=["xlsx", "xls"], key=f"exo_{rid}")
+        f_exo = st.file_uploader(
+            "Sube el Excel descargado de la DIAN (No requiere IA)",
+            type=["xlsx", "xls"], key=f"exo_{rid}",
+        )
         if f_exo is not None:
             try:
                 df_e, rs_e = procesar_exogena(f_exo.getvalue(), anio_gravable)
@@ -1171,28 +1265,42 @@ with t1:
                 inf = leer_pila_pdf(fp.name, fp.getvalue())
                 if inf.get("es_pila"):
                     st.session_state.mem_pila[inf["planilla"]] = {
-                        "Planilla": inf["planilla"], "Periodo": inf["periodo"],
-                        "Salud ($)": float(inf["salud"]), "Pensión ($)": float(inf["pension"]), "ARL ($)": float(inf["arl"]),
+                        "Planilla": inf["planilla"],
+                        "Periodo": inf["periodo"],
+                        "Salud ($)": float(inf["salud"]),
+                        "Pensión ($)": float(inf["pension"]),
+                        "ARL ($)": float(inf["arl"]),
                     }
 
         df_pila_exp = None
         if st.session_state.mem_pila:
             df_p = pd.DataFrame(list(st.session_state.mem_pila.values())).sort_values(by="Periodo").reset_index(drop=True)
-            df_p_ed = st.data_editor(df_p, use_container_width=True, hide_index=True, num_rows="dynamic", key=f"ed_p_{rid}_{len(df_p)}")
+            df_p_ed = st.data_editor(
+                df_p, use_container_width=True, hide_index=True,
+                num_rows="dynamic", key=f"ed_p_{rid}_{len(df_p)}",
+            )
             df_p_ed["Salud + Pensión ($)"] = df_p_ed["Salud ($)"].fillna(0) + df_p_ed["Pensión ($)"].fillna(0)
+            df_p_ed["Total INCRNGO PILA ($)"] = df_p_ed["Salud + Pensión ($)"] + df_p_ed["ARL ($)"].fillna(0)
             df_pila_exp = df_p_ed
-            tot_sp = float(df_p_ed["Salud + Pensión ($)"].sum())
-            tot_arl = float(df_p_ed["ARL ($)"].sum())
+            tot_salud = float(df_p_ed["Salud ($)"].fillna(0).sum())
+            tot_pen = float(df_p_ed["Pensión ($)"].fillna(0).sum())
+            tot_sp = tot_salud + tot_pen
+            tot_arl = float(df_p_ed["ARL ($)"].fillna(0).sum())
+            tot_inc = redondear_dian(tot_sp + tot_arl)
 
             st.info(
                 f"✅ **{len(df_p_ed)} planilla(s) fijas en memoria:** "
-                f"Salud + Pensión = **`${tot_sp:,.0f}`** | ARL = **`${tot_arl:,.0f}`**"
+                f"EPS: **`${tot_salud:,.0f}`** + Pensión: **`${tot_pen:,.0f}`** + ARL: **`${tot_arl:,.0f}`** "
+                f"= **`${tot_sp + tot_arl:,.0f}`** (Casilla 33 DIAN: **`${tot_inc:,.0f}`**)"
             )
             cp1, cp2 = st.columns([3, 1])
             if cp1.button("⚡ Pasar Total PILA a mi Declaración", type="primary", use_container_width=True):
                 d["salud_pension_honorarios"] = tot_sp
                 d["arl_honorarios"] = tot_arl
-                st.session_state.toast_ok = f"✅ ¡PILA aplicada! Salud + Pensión: ${tot_sp:,.0f} | ARL: ${tot_arl:,.0f}."
+                st.session_state.toast_ok = (
+                    f"✅ ¡PILA aplicada! EPS + Pensión: ${tot_sp:,.0f} + ARL: ${tot_arl:,.0f} "
+                    f"→ Casilla 33 INCRNGO: ${tot_inc:,.0f}."
+                )
                 st.session_state.form_id += 1
                 st.rerun()
             if cp2.button("🗑️ Quitar PILA", use_container_width=True):
@@ -1202,7 +1310,10 @@ with t1:
 
         st.divider()
         st.subheader("📄 C. Lector de Otros Certificados (220, CDT, Predial, Salud)")
-        f_certs = st.file_uploader("Sube PDFs o fotos de certificados", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True, key=f"cert_{rid}")
+        f_certs = st.file_uploader(
+            "Sube PDFs o fotos de certificados",
+            type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True, key=f"cert_{rid}",
+        )
         if f_certs:
             bt_ia, bt_nat = st.columns(2)
 
@@ -1258,13 +1369,20 @@ with t1:
             df_c = st.data_editor(df_base, use_container_width=True, hide_index=True, num_rows="dynamic")
             cc1, cc2 = st.columns(2)
             mapeo_campos = [
-                ("efectivo_bancos_dic31", "efectivo"), ("valor_inmueble_o_cdt_dic31", "otros_activos"),
-                ("saldo_deuda_dic31", "deudas"), ("ingresos_brutos_trabajo", "ing_brutos_trabajo"),
-                ("cesantias_exentas", "cesantias_exentas"), ("ingresos_brutos_honorarios", "ing_brutos_honorarios"),
-                ("salud_pension_obligatoria", "salud_pension_trabajo"), ("ingresos_capital_cdt", "ing_brutos_capital"),
-                ("componente_inflacionario_cdt", "incrngo_capital"), ("intereses_vivienda", "intereses_vivienda"),
-                ("medicina_prepagada", "medicina_prepagada"), ("gmf_4x1000_certificado", "gmf_certificado_100"),
-                ("aportes_afc_fpv", "aportes_afc_fpv"), ("retenciones_practicadas", "retenciones_anio"),
+                ("efectivo_bancos_dic31", "efectivo"),
+                ("valor_inmueble_o_cdt_dic31", "otros_activos"),
+                ("saldo_deuda_dic31", "deudas"),
+                ("ingresos_brutos_trabajo", "ing_brutos_trabajo"),
+                ("cesantias_exentas", "cesantias_exentas"),
+                ("ingresos_brutos_honorarios", "ing_brutos_honorarios"),
+                ("salud_pension_obligatoria", "salud_pension_trabajo"),
+                ("ingresos_capital_cdt", "ing_brutos_capital"),
+                ("componente_inflacionario_cdt", "incrngo_capital"),
+                ("intereses_vivienda", "intereses_vivienda"),
+                ("medicina_prepagada", "medicina_prepagada"),
+                ("gmf_4x1000_certificado", "gmf_certificado_100"),
+                ("aportes_afc_fpv", "aportes_afc_fpv"),
+                ("retenciones_practicadas", "retenciones_anio"),
             ]
             if cc1.button("🔄 Reemplazar casillas con estos certificados", type="primary", use_container_width=True):
                 for campo_df, campo_d in mapeo_campos:
@@ -1293,10 +1411,21 @@ with t2:
     d["nombre_declarante"] = i1.text_input("Nombre Completo (Casillas 7-10)", value=d["nombre_declarante"], key=f"nm_{fid}")
     d["nit_declarante"] = i2.text_input("Cédula / NIT sin DV (Casilla 5)", value=d["nit_declarante"], key=f"nt_{fid}")
     i2.caption(f"DV automático (Casilla 6): **{calcular_dv(d['nit_declarante']) or '-'}**")
-    d["seccional_dian"] = i3.selectbox("Seccional DIAN (Casilla 12)", SECCIONALES_DIAN, index=SECCIONALES_DIAN.index(d["seccional_dian"]) if d["seccional_dian"] in SECCIONALES_DIAN else 0, key=f"sc_{fid}")
+    d["seccional_dian"] = i3.selectbox(
+        "Seccional DIAN (Casilla 12)", SECCIONALES_DIAN,
+        index=SECCIONALES_DIAN.index(d["seccional_dian"]) if d["seccional_dian"] in SECCIONALES_DIAN else 0,
+        key=f"sc_{fid}",
+    )
     cods_c = [x.split(" - ")[0] for x in ACTIVIDADES_CIIU]
-    sel_c = i4.selectbox("Actividad Económica CIIU (Casilla 24)", ACTIVIDADES_CIIU, index=cods_c.index(d["cod_actividad"]) if d["cod_actividad"] in cods_c else len(ACTIVIDADES_CIIU) - 1, key=f"ci_{fid}")
-    d["cod_actividad"] = i4.text_input("Código CIIU manual", value=d["cod_actividad"], key=f"cm_{fid}") if sel_c.startswith("OTRO") else sel_c.split(" - ")[0]
+    sel_c = i4.selectbox(
+        "Actividad Económica CIIU (Casilla 24)", ACTIVIDADES_CIIU,
+        index=cods_c.index(d["cod_actividad"]) if d["cod_actividad"] in cods_c else len(ACTIVIDADES_CIIU) - 1,
+        key=f"ci_{fid}",
+    )
+    d["cod_actividad"] = (
+        i4.text_input("Código CIIU manual", value=d["cod_actividad"], key=f"cm_{fid}")
+        if sel_c.startswith("OTRO") else sel_c.split(" - ")[0]
+    )
 
     st.divider()
     p1, p2 = st.columns(2)
@@ -1329,10 +1458,10 @@ with t3:
         st.divider()
         st.subheader("💼 2. Independientes: Servicios y Honorarios")
         d["ing_brutos_honorarios"] = st.number_input("Ingresos por servicios u honorarios", min_value=0.0, value=float(d["ing_brutos_honorarios"]), step=200_000.0, key=f"ih_{fid}")
-        d["salud_pension_honorarios"] = st.number_input("Aportes anuales PILA Salud + Pensión", min_value=0.0, value=float(d["salud_pension_honorarios"]), step=50_000.0, key=f"sph_{fid}")
+        d["salud_pension_honorarios"] = st.number_input("Aportes anuales PILA EPS (Salud) + Pensión", min_value=0.0, value=float(d["salud_pension_honorarios"]), step=50_000.0, key=f"sph_{fid}")
         ca1, ca2 = st.columns(2)
-        d["arl_honorarios"] = ca1.number_input("ARL Riesgos Laborales", min_value=0.0, value=float(d["arl_honorarios"]), step=10_000.0, key=f"arl_{fid}")
-        d["costos_honorarios"] = ca2.number_input("Otros costos con factura", min_value=0.0, value=float(d["costos_honorarios"]), step=100_000.0, key=f"ch_{fid}")
+        d["arl_honorarios"] = ca1.number_input("ARL Riesgos Laborales (Suma a INCRNGO C.33/C.44)", min_value=0.0, value=float(d["arl_honorarios"]), step=10_000.0, key=f"arl_{fid}")
+        d["costos_honorarios"] = ca2.number_input("Costos y gastos con factura (C.45)", min_value=0.0, value=float(d["costos_honorarios"]), step=100_000.0, key=f"ch_{fid}")
 
     with g2:
         st.subheader("🏦 3. Rentas de Capital: CDTs, Intereses y Arriendos")
@@ -1421,21 +1550,40 @@ with t5:
         st.info(f"💡 {sg}")
 
     solo_con_valor = st.checkbox("Ver solo casillas con valores mayores a $0 (Lectura rápida Muisca)", value=False)
-    filas_v = [x for x in filas_formulario_210(r) if (not solo_con_valor or x[2] > 0 or x[0] in ("29", "31", "97", "111", "129", "136", "137"))]
+    filas_v = [
+        x for x in filas_formulario_210(r)
+        if (not solo_con_valor or x[2] > 0 or x[0] in ("29", "31", "97", "111", "129", "136", "137"))
+    ]
     st.dataframe(
-        pd.DataFrame([(c, n, f"{v_c:,.0f}" if c == "138" else f"${v_c:,.0f}") for c, n, v_c in filas_v], columns=["Casilla Muisca", "Concepto Oficial Formulario 210", "Valor Oficial DIAN"]),
-        use_container_width=True, hide_index=True, height=440,
+        pd.DataFrame(
+            [(c, n, f"{v_c:,.0f}" if c == "138" else f"${v_c:,.0f}") for c, n, v_c in filas_v],
+            columns=["Casilla Muisca", "Concepto Oficial Formulario 210", "Valor Oficial DIAN"],
+        ),
+        use_container_width=True, hide_index=True, height=460,
     )
 
     ex_b, wd_b = st.columns(2)
-    ex_b.download_button("📥 Descargar Excel Oficial (.xlsx)", data=generar_excel(r, d, anio_gravable, df_pila_exp), file_name=f"Formulario_210_AG{anio_gravable}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-    wd_b.download_button("📄 Descargar Dictamen Word (.docx)", data=generar_word(r, d, anio_gravable, valor_uvt), file_name=f"Dictamen_Renta_AG{anio_gravable}.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
+    ex_b.download_button(
+        "📥 Descargar Excel Oficial (.xlsx)",
+        data=generar_excel(r, d, anio_gravable, df_pila_exp),
+        file_name=f"Formulario_210_AG{anio_gravable}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+    wd_b.download_button(
+        "📄 Descargar Dictamen Word (.docx)",
+        data=generar_word(r, d, anio_gravable, valor_uvt),
+        file_name=f"Dictamen_Renta_AG{anio_gravable}.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        use_container_width=True,
+    )
 
     st.divider()
     st.subheader("⚖️ Consultor Tributario IA con Gemini")
     for m in st.session_state.chat:
         with st.chat_message(m["role"]):
             st.markdown(m["content"])
+
     preg = st.chat_input("Haz cualquier pregunta sobre tu declaración o casillas del Formulario 210...")
     if preg:
         if not api_key:
@@ -1447,8 +1595,21 @@ with t5:
             with st.chat_message("assistant"):
                 try:
                     with st.spinner("Analizando Estatuto Tributario..."):
-                        sis = f"Eres Contador Tributarista Senior en Colombia. AG {anio_gravable}, UVT ${valor_uvt:,.0f}. Liquidación actual: {json.dumps(r, ensure_ascii=False)}."
-                        ans = llamar_gemini(api_key, preg, system_instruction=sis, temperatura=0.2)
+                        sis = (
+                            f"Eres Contador Tributarista Senior experto en DIAN Colombia. "
+                            f"AG {anio_gravable}, UVT ${valor_uvt:,.0f}. Recuerda que según Concepto Unificado DIAN "
+                            f"0912 de 2018 (Descriptor 1.12) y Arts. 55-56 E.T., EPS + Pensión + ARL pagados por el "
+                            f"independiente van como Ingreso No Constitutivo de Renta (Casilla 33 o 44). "
+                            f"Liquidación actual del contribuyente: {json.dumps(r, ensure_ascii=False)}."
+                        )
+                        historial = [
+                            types.Content(
+                                role="user" if msg["role"] == "user" else "model",
+                                parts=[types.Part.from_text(text=msg["content"])],
+                            )
+                            for msg in st.session_state.chat[-8:]
+                        ]
+                        ans = llamar_gemini(api_key, historial, system_instruction=sis, temperatura=0.2)
                         st.markdown(ans)
                         st.session_state.chat.append({"role": "assistant", "content": ans})
                 except Exception as e:
