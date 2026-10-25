@@ -20,12 +20,24 @@ from google.genai import types
 from google.genai.errors import APIError
 
 try:
-    from pdf2image import convert_from_bytes
-    import pytesseract
     from PIL import Image
-    OCR_DISPONIBLE = True
+    PIL_DISPONIBLE = True
 except Exception:
-    OCR_DISPONIBLE = False
+    PIL_DISPONIBLE = False
+
+try:
+    from pdf2image import convert_from_bytes
+    PDF2IMG_DISPONIBLE = True
+except Exception:
+    PDF2IMG_DISPONIBLE = False
+
+try:
+    import pytesseract
+    TESSERACT_DISPONIBLE = True
+except Exception:
+    TESSERACT_DISPONIBLE = False
+
+OCR_DISPONIBLE = PIL_DISPONIBLE and TESSERACT_DISPONIBLE
 
 st.set_page_config(
     page_title="RentaIA Pro | Formulario 210 DIAN",
@@ -72,12 +84,12 @@ TABLA_ART_241 = [
 ]
 
 MODELOS_PREFERIDOS_GEMINI = [
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-flash-lite-preview",
     "gemini-3.8-flash",
     "gemini-3.6-flash",
-    "gemini-3.5-flash-lite",
     "gemini-flash-latest",
-    "gemini-3-flash-preview",
-    "gemini-2.5-flash",
 ]
 
 
@@ -102,7 +114,6 @@ def calcular_dv(nit_str: str) -> str:
 
 
 def normalizar_entidad(texto: str) -> str:
-    """Unifica nombres y NITs bancarios/terceros para evitar duplicados entre Exógena y PDFs."""
     t = (texto or "").lower()
     t = t.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
     if any(k in t for k in ("bbva", "bilbao", "860003020")):
@@ -130,7 +141,7 @@ def normalizar_entidad(texto: str) -> str:
 
 
 # ==============================================================================
-# 2. SEGURIDAD Y CONEXIÓN GEMINI INTELIGENTE ('AIza...' + 'AQ....' + GEMINI 3.x)
+# 2. SEGURIDAD Y CONEXIÓN GEMINI INTELIGENTE ('AIza...' + 'AQ....' + CACHÉ MODELO)
 # ==============================================================================
 def limpiar_key(raw: str) -> str:
     if not raw:
@@ -250,10 +261,17 @@ def llamar_gemini(
 
     ultimo_err = None
     errores_modelos = []
+    modelo_cache = st.session_state.get("modelo_gemini_ok")
 
     for nombre_cli, cli in clientes:
         abortar_este_cliente = False
-        modelos_cola = list(MODELOS_PREFERIDOS_GEMINI)
+        modelos_cola = []
+        if modelo_cache:
+            modelos_cola.append(modelo_cache)
+        for m_pref in MODELOS_PREFERIDOS_GEMINI:
+            if m_pref not in modelos_cola:
+                modelos_cola.append(m_pref)
+
         descubrimiento_hecho = False
         idx_m = 0
 
@@ -270,6 +288,7 @@ def llamar_gemini(
                     texto = getattr(respuesta, "text", None)
                     if not texto or not str(texto).strip():
                         raise RuntimeError(f"Gemini devolvió respuesta vacía en {mod}.")
+                    st.session_state["modelo_gemini_ok"] = mod
                     return str(texto)
                 except APIError as e:
                     ultimo_err = e
@@ -281,7 +300,7 @@ def llamar_gemini(
                             "quota_exceeded", "daily limit", "limit: 0", "billing", "generaterequestsperday"
                         )
                         if any(p in detalle for p in indicadores_cuota):
-                            errores_modelos.append(f"{nombre_cli}/{mod}: cuota agotada en este modelo")
+                            errores_modelos.append(f"{nombre_cli}/{mod}: cuota agotada")
                             break
                         if intento < 2:
                             time.sleep((2, 5)[intento])
@@ -386,8 +405,6 @@ def liquidar_210(
     c77 = min(neto_nl, redondear_dian(d["costos_no_laborales"]))
     c78 = max(0, neto_nl - c77)
 
-    # Art. 55 y 56 E.T. + Concepto Unificado DIAN 0912 de 2018 (Descriptor 1.12):
-    # EPS (Salud) + Pensión + ARL pagados por el independiente son INCRNGO en Casilla 33 o 44.
     trab_bruto_tot = redondear_dian(d["ing_brutos_trabajo"] + d["ing_brutos_honorarios"])
     inc_trab_tot = min(
         trab_bruto_tot,
@@ -411,14 +428,12 @@ def liquidar_210(
     lim_40 = redondear_dian(min(ing_netos_cg * 0.40, 1_340 * uvt))
     tope_790 = 790 * uvt
 
-    # Estrategia A: Rentas de Trabajo con 25% Exento (Casillas 32-42)
     c34_a = max(0, trab_bruto_tot - inc_trab_tot)
     c91_a = c34_a + c61 + c78
     ex25_a = redondear_dian(min(max(0, c34_a - ded_comunes) * 0.25, tope_790))
     acep_a = min(ded_comunes + ex25_a, lim_40, c91_a)
     rem_a = max(0, c91_a - acep_a)
 
-    # Estrategia B: Honorarios sujetos a costos y gastos procedentes (Casillas 43-46)
     cost_hon = redondear_dian(d["costos_honorarios"])
     c32_b = redondear_dian(d["ing_brutos_trabajo"])
     c33_b = min(c32_b, redondear_dian(d["salud_pension_trabajo"]))
@@ -538,8 +553,8 @@ def liquidar_210(
         c59_esp = redondear_dian(d["ing_brutos_capital"] * pct_inf)
         if abs(c59 - c59_esp) >= 2_000:
             sugerencias.append(
-                f"Casilla 59 ({c59:,.0f}) difiere del {pct_inf*100:.2f}% oficial para rendimientos financieros (${c59_esp:,.0f}). "
-                "Verifica en el Paso 3 si Casilla 58 incluye arriendos o si debes activar el cálculo automático."
+                f"Casilla 59 (${c59:,.0f}) difiere del {pct_inf*100:.2f}% oficial para rendimientos financieros (${c59_esp:,.0f}). "
+                "Verifica en el Paso 3 si Casilla 58 incluye arriendos o activa el cálculo automático."
             )
     if hay_trab and inc_trab_tot == 0:
         sugerencias.append("Recuerda cargar tus planillas PILA en el Paso 1 o digitar EPS, Pensión y ARL en el Paso 3.")
@@ -565,7 +580,7 @@ def liquidar_210(
 
 
 # ==============================================================================
-# 4. LECTORES CON CACHÉ SHA-256 + DEDUPLICADOR DE BANCOS + CONCILIACIÓN EXÓGENA
+# 4. LECTORES CON DESENCRIPTADO PDF BANCARIO + CONVERSIÓN JPEG + ANTI-DUPLICADOS
 # ==============================================================================
 CAMPOS_SOPORTE = [
     "efectivo_bancos_dic31", "valor_inmueble_o_cdt_dic31", "saldo_deuda_dic31",
@@ -617,27 +632,95 @@ def validar_archivo_soporte(nombre: str, b: bytes, mime: str) -> None:
 
 
 def extraer_texto_hibrido(b: bytes, mime: str) -> str:
+    """Desencripta PDFs bancarios con clave vacía y aplica OCR con fallback de idioma."""
     if mime == "application/pdf":
         try:
             lector = pypdf.PdfReader(io.BytesIO(b))
+            if getattr(lector, "is_encrypted", False):
+                try:
+                    lector.decrypt("")
+                except Exception:
+                    pass
             txt = "\n".join((p.extract_text() or "") for p in lector.pages[:4]).strip()
             if len(txt) >= 35:
                 return txt
         except Exception:
             pass
-        if OCR_DISPONIBLE:
+        if PDF2IMG_DISPONIBLE and OCR_DISPONIBLE:
             try:
                 imgs = convert_from_bytes(b, first_page=1, last_page=2, dpi=150)
-                return "\n".join(pytesseract.image_to_string(im, lang="spa") for im in imgs).strip()
+                textos_ocr = []
+                for im in imgs:
+                    try:
+                        textos_ocr.append(pytesseract.image_to_string(im, lang="spa"))
+                    except Exception:
+                        textos_ocr.append(pytesseract.image_to_string(im))
+                return "\n".join(textos_ocr).strip()
             except Exception:
                 pass
     elif OCR_DISPONIBLE:
         try:
             im = Image.open(io.BytesIO(b))
-            return pytesseract.image_to_string(im, lang="spa").strip()
+            try:
+                return pytesseract.image_to_string(im, lang="spa").strip()
+            except Exception:
+                return pytesseract.image_to_string(im).strip()
         except Exception:
             pass
     return ""
+
+
+def convertir_soporte_a_partes_seguras(nombre: str, b: bytes, mime: str) -> List[Any]:
+    """
+    Convierte PDFs bancarios protegidos (/Encrypt) o escaneados en imágenes JPEG ligeras (~120 KB)
+    para evitar que la API de Gemini devuelva 'HTTP 400 Request contains an invalid argument'.
+    """
+    partes: List[Any] = [types.Part.from_text(text=f"=== ARCHIVO_ID: {nombre} ===")]
+
+    if mime in ("image/png", "image/jpeg", "image/jpg"):
+        if PIL_DISPONIBLE:
+            try:
+                im = Image.open(io.BytesIO(b)).convert("RGB")
+                im.thumbnail((1600, 1600))
+                buf = io.BytesIO()
+                im.save(buf, format="JPEG", quality=82)
+                partes.append(types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
+                return partes
+            except Exception:
+                pass
+        partes.append(types.Part.from_bytes(data=b, mime_type=mime))
+        return partes
+
+    if mime == "application/pdf":
+        if PDF2IMG_DISPONIBLE and PIL_DISPONIBLE:
+            try:
+                imgs = convert_from_bytes(b, first_page=1, last_page=2, dpi=140)
+                for im in imgs:
+                    im_rgb = im.convert("RGB")
+                    im_rgb.thumbnail((1600, 1600))
+                    buf = io.BytesIO()
+                    im_rgb.save(buf, format="JPEG", quality=82)
+                    partes.append(types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
+                if len(partes) > 1:
+                    return partes
+            except Exception:
+                pass
+
+        try:
+            lector = pypdf.PdfReader(io.BytesIO(b))
+            if getattr(lector, "is_encrypted", False):
+                lector.decrypt("")
+            escritor = pypdf.PdfWriter()
+            for p in lector.pages[:3]:
+                escritor.add_page(p)
+            buf_pdf = io.BytesIO()
+            escritor.write(buf_pdf)
+            partes.append(types.Part.from_bytes(data=buf_pdf.getvalue(), mime_type="application/pdf"))
+            return partes
+        except Exception:
+            pass
+
+    return []
 
 
 def parsear_json_soportes(texto_raw: str) -> List[dict]:
@@ -670,10 +753,6 @@ def parsear_json_soportes(texto_raw: str) -> List[dict]:
 
 
 def deduplicar_certificados_lote(registros: List[dict]) -> Tuple[List[dict], List[str]]:
-    """
-    Evita doble conteo cuando para un mismo banco el usuario sube el Certificado de Saldo/CDT
-    y simultáneamente el Certificado de Retención en la Fuente (que repite la base del rendimiento).
-    """
     avisos: List[str] = []
     limpios = [dict(r) for r in registros]
     por_entidad: Dict[str, List[dict]] = {}
@@ -790,27 +869,35 @@ def extraer_soporte_nativo_sin_ia(nombre: str, b: bytes, mime: str) -> dict:
     return res
 
 
-def extraer_pendientes_con_ia(api_key: str, pendientes: List[Tuple[Any, bytes, str]]) -> List[dict]:
+def _ejecutar_lote_ia(api_key: str, lote: List[Tuple[Any, bytes, str]]) -> List[dict]:
     bloques_texto = []
     partes_visuales: List[Any] = []
+    respaldo_local_directo: List[dict] = []
 
-    for fc, b, _ in pendientes:
+    for fc, b, _ in lote:
         validar_archivo_soporte(fc.name, b, fc.type)
         txt = extraer_texto_hibrido(b, fc.type)
-        if len(txt) >= 30:
+        if len(txt) >= 35:
             bloques_texto.append(f"=== ARCHIVO_ID: {fc.name} ===\n{txt[:9500]}")
         else:
-            partes_visuales.append(types.Part.from_text(text=f"=== ARCHIVO_ID: {fc.name} ==="))
-            partes_visuales.append(types.Part.from_bytes(data=b, mime_type=fc.type))
+            p_seguras = convertir_soporte_a_partes_seguras(fc.name, b, fc.type)
+            if p_seguras:
+                partes_visuales.extend(p_seguras)
+            else:
+                respaldo_local_directo.append(extraer_soporte_nativo_sin_ia(fc.name, b, fc.type))
+
+    esperados = len(lote) - len(respaldo_local_directo)
+    if esperados <= 0:
+        return respaldo_local_directo
 
     instruccion = (
         "Actúa como extractor contable DIAN Colombia (no inventes valores). "
-        f"Devuelve exactamente {len(pendientes)} elemento(s) en 'documentos', uno por cada ARCHIVO_ID, "
+        f"Devuelve exactamente {esperados} elemento(s) en 'documentos', uno por cada ARCHIVO_ID, "
         "usando el nombre exacto en 'archivo'. En 'tipo_documento' usa exactamente uno de: "
         "'Certificado CDT', 'Certificado Saldo e Intereses', 'Certificado Retefuente', 'Formulario 220', 'Predial', 'Otro'.\n"
         "REGLA CRÍTICA ANTI-DUPLICIDAD: Si un documento es únicamente un 'Certificado Retefuente' (certificado anual de retención en la fuente), "
         "extrae SOLO 'retenciones_practicadas' y 'gmf_4x1000_certificado', y pon 0 en 'ingresos_capital_cdt' y 'ingresos_brutos_honorarios' "
-        "si en el lote ya vienen certificados de CDT/Saldo de esa misma entidad (para no duplicar la base sujeta a retención).\n"
+        "si en el lote ya vienen certificados de CDT/Saldo de esa misma entidad.\n"
         "Responde SOLO con JSON válido:\n"
         '{"documentos": [{"archivo": "nombre.pdf", "tipo_documento": "Certificado CDT", '
         '"entidad": "BBVA Colombia", "efectivo_bancos_dic31": 0, "valor_inmueble_o_cdt_dic31": 0, '
@@ -825,17 +912,47 @@ def extraer_pendientes_con_ia(api_key: str, pendientes: List[Tuple[Any, bytes, s
         prompt_final = "\n\n".join(bloques_texto) + "\n\n" + instruccion
         resp_txt = llamar_gemini(api_key, prompt_final, temperatura=0.0)
     else:
+        todas_partes: List[Any] = list(partes_visuales)
         if bloques_texto:
-            partes_visuales.append(types.Part.from_text(text="\n\n".join(bloques_texto)))
-        partes_visuales.append(types.Part.from_text(text=instruccion))
-        resp_txt = llamar_gemini(api_key, partes_visuales, temperatura=0.0)
+            todas_partes.append(types.Part.from_text(text="\n\n".join(bloques_texto)))
+        todas_partes.append(types.Part.from_text(text=instruccion))
+        contenido_estructurado = [types.Content(role="user", parts=todas_partes)]
+        resp_txt = llamar_gemini(api_key, contenido_estructurado, temperatura=0.0)
 
-    return parsear_json_soportes(resp_txt)
+    return parsear_json_soportes(resp_txt) + respaldo_local_directo
+
+
+def extraer_pendientes_con_ia(api_key: str, pendientes: List[Tuple[Any, bytes, str]]) -> List[dict]:
+    """Procesa en sublotes seguros de hasta 4 archivos y aísla cualquier PDF corrupto sin tumbar los demás."""
+    salida_total: List[dict] = []
+    tam_lote = 4
+    for i in range(0, len(pendientes), tam_lote):
+        sublote = pendientes[i : i + tam_lote]
+        try:
+            salida_total.extend(_ejecutar_lote_ia(api_key, sublote))
+        except Exception:
+            if len(sublote) == 1:
+                arc, cont, _ = sublote[0]
+                salida_total.append(extraer_soporte_nativo_sin_ia(arc.name, cont, arc.type))
+            else:
+                for item_ind in sublote:
+                    try:
+                        salida_total.extend(_ejecutar_lote_ia(api_key, [item_ind]))
+                    except Exception:
+                        arc, cont, _ = item_ind
+                        salida_total.append(extraer_soporte_nativo_sin_ia(arc.name, cont, arc.type))
+    return salida_total
 
 
 def leer_pila_pdf(nombre: str, b: bytes) -> dict:
     try:
-        txt = "\n".join((p.extract_text() or "") for p in pypdf.PdfReader(io.BytesIO(b)).pages)
+        lector = pypdf.PdfReader(io.BytesIO(b))
+        if getattr(lector, "is_encrypted", False):
+            try:
+                lector.decrypt("")
+            except Exception:
+                pass
+        txt = "\n".join((p.extract_text() or "") for p in lector.pages)
     except Exception:
         return {"es_pila": False}
 
@@ -1145,7 +1262,7 @@ def generar_word(r: dict, d: dict, anio: int, uvt: float) -> bytes:
 
 
 # ==============================================================================
-# 6. INTERFAZ PRINCIPAL BLINDADA (v5.6 FUSIÓN PRO — ANTI-DUPLICADOS)
+# 6. INTERFAZ PRINCIPAL BLINDADA (v5.7 FUSIÓN PRO — VISIÓN JPEG + MUISCA EXACTO)
 # ==============================================================================
 if not verificar_acceso():
     st.stop()
@@ -1183,7 +1300,7 @@ d = st.session_state.datos
 
 with st.sidebar:
     st.title("⚙️ Configuración DIAN")
-    st.caption("Versión **v5.6 Fusión Pro** • Anti-Duplicados + Conciliación Exógena")
+    st.caption("Versión **v5.7 Fusión Pro** • PDF Bancario Desencriptado + Visión JPEG")
 
     sec_key = obtener_secreto("GEMINI_API_KEY")
     if sec_key:
@@ -1429,7 +1546,7 @@ with t1:
         st.divider()
         st.subheader("📄 C. Lector de Otros Certificados (220, CDT, Predial, Salud)")
         f_certs = st.file_uploader(
-            "Sube PDFs o fotos de certificados (filtra duplicados entre Retefuente y Saldo del mismo banco)",
+            "Sube PDFs o fotos de certificados (desencripta bancos y filtra duplicados automáticamente)",
             type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True, key=f"cert_{rid}",
         )
         if f_certs:
@@ -1449,23 +1566,16 @@ with t1:
                             pendientes.append((arc, cont, h_sha))
 
                     if pendientes:
-                        try:
-                            with st.spinner(f"Procesando {len(pendientes)} soporte(s) nuevo(s) en 1 sola llamada IA..."):
-                                lista_nuevos = extraer_pendientes_con_ia(api_key, pendientes)
-                                mapa_nombre = {it.get("archivo", ""): it for it in lista_nuevos}
-                                for idx_p, (arc, cont, h_sha) in enumerate(pendientes):
-                                    item_ok = mapa_nombre.get(arc.name) or (
-                                        lista_nuevos[idx_p] if idx_p < len(lista_nuevos) else extraer_soporte_nativo_sin_ia(arc.name, cont, arc.type)
-                                    )
-                                    item_ok["archivo"] = arc.name
-                                    item_ok["_sha256"] = h_sha
-                                    resultados[h_sha] = item_ok
-                        except Exception as e:
-                            st.warning(f"⚠️ Aviso IA ({e}). Extrayendo automáticamente con motor local PDF + OCR...")
-                            for arc, cont, h_sha in pendientes:
-                                item_loc = extraer_soporte_nativo_sin_ia(arc.name, cont, arc.type)
-                                item_loc["_sha256"] = h_sha
-                                resultados[h_sha] = item_loc
+                        with st.spinner(f"Procesando {len(pendientes)} soporte(s) con Visión IA..."):
+                            lista_nuevos = extraer_pendientes_con_ia(api_key, pendientes)
+                            mapa_nombre = {it.get("archivo", ""): it for it in lista_nuevos}
+                            for idx_p, (arc, cont, h_sha) in enumerate(pendientes):
+                                item_ok = mapa_nombre.get(arc.name) or (
+                                    lista_nuevos[idx_p] if idx_p < len(lista_nuevos) else extraer_soporte_nativo_sin_ia(arc.name, cont, arc.type)
+                                )
+                                item_ok["archivo"] = arc.name
+                                item_ok["_sha256"] = h_sha
+                                resultados[h_sha] = item_ok
 
                     lote_bruto = sin_huella + list(resultados.values())
                     limpios, avisos = deduplicar_certificados_lote(lote_bruto)
