@@ -57,23 +57,6 @@ ACTIVIDADES_CIIU = [
     "OTRO - Digitar otro código CIIU",
 ]
 
-# PARÁMETRO CORREGIDO: Límites Ley 2277 que faltaban en la versión anterior
-LIMITES_LEY_2277 = {
-    "pct_bolsa_global": 0.40,
-    "tope_bolsa_uvt": 1_340,
-    "exenta_25_uvt": 790,
-    "vivienda_uvt": 1_200,
-    "prepagada_mes_uvt": 16,
-    "dep_10pct_mes_uvt": 32,
-    "dep_extra_uvt": 72,
-    "max_dep_extra": 4,
-    "icetex_uvt": 100,
-    "factura_elec_pct": 0.01,
-    "factura_elec_uvt": 240,
-    "afc_fpv_uvt": 3_800,
-    "pensiones_exentas_uvt": 12_000,
-}
-
 TABLA_ART_241 = [
     (0, 1_090, 0.00, 0),
     (1_090, 1_700, 0.19, 0),
@@ -109,6 +92,7 @@ def calcular_dv(nit_str: str) -> str:
 # 2. SEGURIDAD Y CONEXIÓN GEMINI INTELIGENTE ('AIza...' + 'AQ....' SIN BLOQUEOS)
 # ==============================================================================
 def limpiar_key(raw: str) -> str:
+    """Acepta claves estándar de Google AI Studio (AIza...) y claves Vertex Express (AQ....)."""
     if not raw:
         return ""
     txt = str(raw).strip()
@@ -160,11 +144,21 @@ def verificar_acceso() -> bool:
     return False
 
 
-def obtener_cliente_exacto(llave: str):
-    """Evita fallos al detectar automáticamente si es clave temporal (AQ.) o fija (AIza)."""
+def crear_clientes_gemini(llave: str) -> List[Tuple[str, Any]]:
+    """Construye los clientes compatibles sin abortar antes de probar alternativas."""
+    clientes = []
     if llave.startswith("AQ."):
-        return genai.Client(vertexai=True, api_key=llave)
-    return genai.Client(api_key=llave)
+        try:
+            clientes.append(("VertexAI", genai.Client(vertexai=True, api_key=llave)))
+        except Exception:
+            pass
+        try:
+            clientes.append(("AIStudio", genai.Client(api_key=llave)))
+        except Exception:
+            pass
+    else:
+        clientes.append(("AIStudio", genai.Client(api_key=llave)))
+    return clientes
 
 
 def llamar_gemini(
@@ -173,76 +167,93 @@ def llamar_gemini(
     system_instruction: str = None,
     temperatura: float = 0.0,
 ) -> str:
+    """Consulta Gemini con modelos 2026 vigentes, detección de cuota agotada y fallback real entre clientes."""
     llave = limpiar_key(api_key)
     if not llave:
-        raise ValueError("Configura tu GEMINI_API_KEY en Configuración -> Secrets o en la barra lateral.")
+        raise ValueError(
+            "Falta una clave válida de Gemini ('AIza...' o 'AQ....') en Configuración -> Secrets o en la barra lateral."
+        )
 
-    cli = obtener_cliente_exacto(llave)
+    clientes = crear_clientes_gemini(llave)
+    if not clientes:
+        raise RuntimeError("No se pudo inicializar el cliente de Gemini. Revisa la clave configurada.")
+
     cfg_kwargs: Dict[str, Any] = {"temperature": temperatura}
     if system_instruction:
         cfg_kwargs["system_instruction"] = system_instruction
     config = types.GenerateContentConfig(**cfg_kwargs)
 
+    modelos = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
     ultimo_err = None
     errores_modelos = []
-    
-    for mod in ["gemini-2.5-flash", "gemini-2.5-flash-lite"]:
-        for intento in range(3):
-            try:
-                respuesta = cli.models.generate_content(model=mod, contents=contents, config=config)
-                texto = getattr(respuesta, "text", None)
-                if not texto or not str(texto).strip():
-                    raise RuntimeError(f"Gemini devolvió respuesta vacía en {mod}.")
-                return str(texto)
-            except APIError as e:
-                ultimo_err = e
-                codigo = getattr(e, "code", None) or getattr(e, "status_code", None)
-                detalle = str(e).lower()
 
-                if codigo == 429:
-                    if any(p in detalle for p in ("quota_exceeded", "daily limit", "limit: 0", "billing", "generaterequestsperday")):
-                        raise RuntimeError(
-                            "CUOTA_GEMINI_AGOTADA: Google reporta cuota diaria/proyecto agotada. "
-                            "Usa el botón 'Extraer SIN IA' o espera a que se restablezca la cuota."
-                        ) from e
-                    if intento < 2:
-                        time.sleep((3, 6)[intento])
+    for nombre_cli, cli in clientes:
+        abortar_este_cliente = False
+        for mod in modelos:
+            if abortar_este_cliente:
+                break
+            for intento in range(3):
+                try:
+                    respuesta = cli.models.generate_content(model=mod, contents=contents, config=config)
+                    texto = getattr(respuesta, "text", None)
+                    if not texto or not str(texto).strip():
+                        raise RuntimeError(f"Gemini devolvió respuesta vacía en {mod}.")
+                    return str(texto)
+                except APIError as e:
+                    ultimo_err = e
+                    codigo = getattr(e, "code", None) or getattr(e, "status_code", None)
+                    detalle = str(e).lower()
+
+                    if codigo == 429:
+                        indicadores_cuota = (
+                            "quota_exceeded", "daily limit", "limit: 0", "billing", "generaterequestsperday"
+                        )
+                        if any(p in detalle for p in indicadores_cuota):
+                            raise RuntimeError(
+                                "CUOTA_GEMINI_AGOTADA: Google reporta cuota diaria/proyecto agotada. "
+                                "Usa el botón 'Extraer SIN IA' o espera a que se restablezca la cuota."
+                            ) from e
+                        if intento < 2:
+                            time.sleep((3, 6)[intento])
+                            continue
+                        errores_modelos.append(f"{nombre_cli}/{mod}: HTTP 429 (límite por minuto)")
+                        break
+
+                    if codigo in (401, 403):
+                        errores_modelos.append(f"{nombre_cli}/{mod}: HTTP {codigo} (permisos/autenticación)")
+                        abortar_este_cliente = True
+                        break
+
+                    if codigo == 400:
+                        errores_modelos.append(f"{nombre_cli}/{mod}: HTTP 400 ({str(e)[:120]})")
+                        break
+
+                    if codigo == 404:
+                        errores_modelos.append(f"{nombre_cli}/{mod}: HTTP 404 (modelo no disponible)")
+                        break
+
+                    if codigo is not None and codigo >= 500 and intento < 2:
+                        time.sleep(2 * (intento + 1))
                         continue
-                    errores_modelos.append(f"{mod}: HTTP 429 (límite por minuto)")
+
+                    errores_modelos.append(f"{nombre_cli}/{mod}: HTTP {codigo} ({str(e)[:120]})")
                     break
-
-                if codigo in (400, 401, 403, 404):
-                    errores_modelos.append(f"{mod}: HTTP {codigo} (Rechazo API)")
+                except (TimeoutError, ConnectionError) as e:
+                    ultimo_err = e
+                    if intento < 2:
+                        time.sleep(2 * (intento + 1))
+                        continue
+                    errores_modelos.append(f"{nombre_cli}/{mod}: error de red ({e})")
                     break
-
-                if codigo is not None and codigo >= 500 and intento < 2:
-                    time.sleep(2 * (intento + 1))
-                    continue
-
-                errores_modelos.append(f"{mod}: HTTP {codigo} ({str(e)[:120]})")
-                break
-            except (TimeoutError, ConnectionError) as e:
-                ultimo_err = e
-                if intento < 2:
-                    time.sleep(2 * (intento + 1))
-                    continue
-                errores_modelos.append(f"{mod}: error de red ({e})")
-                break
-            except RuntimeError:
-                raise
-            except Exception as e:
-                ultimo_err = e
-                errores_modelos.append(f"{mod}: {type(e).__name__}: {str(e)[:120]}")
-                break
+                except RuntimeError:
+                    raise
+                except Exception as e:
+                    ultimo_err = e
+                    errores_modelos.append(f"{nombre_cli}/{mod}: {type(e).__name__}: {str(e)[:120]}")
+                    break
 
     resumen_err = " | ".join(errores_modelos) or str(ultimo_err)
-    if "401" in resumen_err or "403" in resumen_err or "404" in resumen_err:
-        if llave.startswith("AQ."):
-            raise RuntimeError(
-                f"La clave temporal 'AQ.' caducó o no tiene permisos de Vertex AI. "
-                "Crea una clave gratuita 'AIzaSy...' en aistudio.google.com/apikey y guárdala en Secrets."
-            )
-    raise RuntimeError(f"No se pudo completar la consulta a Gemini. Detalle técnico: {resumen_err}")
+    raise RuntimeError(f"No se pudo completar la consulta a Gemini. Detalle técnico: {resumen_err}") from ultimo_err
 
 
 # ==============================================================================
@@ -279,15 +290,11 @@ def impuesto_art241(rlg: float, uvt: float) -> float:
 
 
 def liquidar_210(d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, uvt_san: float) -> Dict[str, Any]:
-    L = LIMITES_LEY_2277
-
-    # 1. PATRIMONIO
     pat_raw = d["efectivo"] + d["otros_activos"] + d["inmuebles"] + d["vehiculos"]
     c29 = redondear_dian(pat_raw)
     c30 = redondear_dian(d["deudas"])
     c31 = max(0, c29 - c30)
 
-    # 2. RENTAS DE CAPITAL Y NO LABORALES
     c58 = redondear_dian(d["ing_brutos_capital"])
     c59 = min(c58, redondear_dian(d["incrngo_capital"]))
     neto_cap = max(0, c58 - c59)
@@ -300,11 +307,8 @@ def liquidar_210(d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, 
     c77 = min(neto_nl, redondear_dian(d["costos_no_laborales"]))
     c78 = max(0, neto_nl - c77)
 
-    # 3. RENTAS DE TRABAJO Y HONORARIOS (Concepto Unificado DIAN 0912/2018 -> ARL es INCRNGO Casilla 33/44)
-    incrngo_trab_tot_pesos = d["salud_pension_trabajo"] + d["salud_pension_honorarios"] + d["arl_honorarios"]
     trab_bruto_tot = redondear_dian(d["ing_brutos_trabajo"]) + redondear_dian(d["ing_brutos_honorarios"])
-    inc_trab_tot = min(trab_bruto_tot, redondear_dian(incrngo_trab_tot_pesos))
-    
+    inc_trab_tot = min(trab_bruto_tot, redondear_dian(d["salud_pension_trabajo"]) + redondear_dian(d["salud_pension_honorarios"]))
     ing_brutos_cg = trab_bruto_tot + c58 + c74
     ing_netos_cg = max(0, trab_bruto_tot - inc_trab_tot) + neto_cap + neto_nl
     hay_trab = trab_bruto_tot > 0
@@ -312,68 +316,56 @@ def liquidar_210(d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, 
     c38 = redondear_dian(min(d["intereses_vivienda"], 1_200 * uvt))
     ded_prep = redondear_dian(min(d["medicina_prepagada"], 192 * uvt)) if hay_trab else 0
     ded_dep10 = redondear_dian(min(trab_bruto_tot * 0.10, 384 * uvt)) if (d["num_dependientes"] > 0 and hay_trab) else 0
-    ded_ice = redondear_dian(min(d.get("intereses_icetex", 0.0), 100 * uvt))
+    ded_ice = redondear_dian(min(d["intereses_icetex"], 100 * uvt))
     ded_gmf = redondear_dian(d["gmf_certificado_100"] * 0.50)
     c39 = ded_prep + ded_dep10 + ded_ice + ded_gmf
     c35 = redondear_dian(min(d["aportes_afc_fpv"], ing_brutos_cg * 0.30, 3_800 * uvt))
-    ces_ex = redondear_dian(d.get("cesantias_exentas", 0.0))
+    ces_ex = redondear_dian(d["cesantias_exentas"])
 
     ded_comunes = c38 + c39 + c35 + ces_ex
     lim_40 = redondear_dian(min(ing_netos_cg * 0.40, 1_340 * uvt))
     tope_790 = 790 * uvt
 
-    # Ruta A: Todo va en Casilla 32 con derecho al 25% Exento
-    c32_a = ing_trab_total_bruto = trab_bruto_tot
-    c33_a = inc_trab_tot
-    c34_a = max(0, c32_a - c33_a)
+    c34_a = max(0, trab_bruto_tot - inc_trab_tot)
     c91_a = c34_a + c61 + c78
-    base_25_a = max(0, c34_a - deducciones_comunes)
-    exenta_25_a = redondear_dian(min(base_25_a * 0.25, tope_790))
-    solicitados_a = deducciones_comunes + exenta_25_a
-    aceptados_40_a = min(solicitados_a, lim_40, c91_a)
-    rem_a = max(0, c91_a - aceptados_40_a)
+    ex25_a = redondear_dian(min(max(0, c34_a - ded_comunes) * 0.25, tope_790))
+    acep_a = min(ded_comunes + ex25_a, lim_40, c91_a)
+    rem_a = max(0, c91_a - acep_a)
 
-    # Ruta B: Honorarios en C.43 (Con costos C.45)
-    cost_hon = redondear_dian(d["costos_honorarios"])
+    cost_hon = redondear_dian(d["costos_honorarios"] + d["arl_honorarios"])
     c32_b = redondear_dian(d["ing_brutos_trabajo"])
     c33_b = min(c32_b, redondear_dian(d["salud_pension_trabajo"]))
     c34_b = max(0, c32_b - c33_b)
-    
     c43_b = redondear_dian(d["ing_brutos_honorarios"])
-    pila_hon = redondear_dian(d["salud_pension_honorarios"] + d["arl_honorarios"]) + max(0, redondear_dian(d["salud_pension_trabajo"]) - c33_b)
+    pila_hon = redondear_dian(d["salud_pension_honorarios"]) + max(0, redondear_dian(d["salud_pension_trabajo"]) - c33_b)
     c44_b = min(c43_b, pila_hon)
     neto_h_b = max(0, c43_b - c44_b)
     c45_b = min(neto_h_b, cost_hon)
     c46_b = max(0, neto_h_b - c45_b)
-    
     c91_b = c34_b + c46_b + c61 + c78
-    base_25_b = max(0, c34_b - deducciones_comunes)
-    exenta_25_b = redondear_dian(min(base_25_b * 0.25, tope_790))
-    solicitados_b = deducciones_comunes + exenta_25_b
-    aceptados_40_b = min(solicitados_b, lim_40, c91_b)
-    rem_b = max(0, c91_b - aceptados_40_b)
+    ex25_b = redondear_dian(min(max(0, c34_b - ded_comunes) * 0.25, tope_790))
+    acep_b = min(ded_comunes + ex25_b, lim_40, c91_b)
+    rem_b = max(0, c91_b - acep_b)
 
     if cost_hon > 0 and c43_b > 0 and rem_b < rem_a:
-        estrategia = "Honorarios con Costos (Casillas 43-46 — menor impuesto)"
+        estrategia = "Honorarios con Costos + ARL (Casillas 43-46)"
         c32, c33, c34 = c32_b, c33_b, c34_b
         c43, c44, c45, c46 = c43_b, c44_b, c45_b, c46_b
-        c91, c36, ben_40, sol_40, rem_cg = c91_b, ex25_b + ces_ex, aceptados_40_b, solicitados_b, rem_b
+        c91, c36, ben_40, sol_40, rem_cg = c91_b, ex25_b + ces_ex, acep_b, ded_comunes + ex25_b, rem_b
     else:
-        estrategia = "Rentas de Trabajo con 25% Exento (Casillas 32-36 — óptima DIAN)"
-        c32, c33, c34 = c32_a, c33_a, c34_a
+        estrategia = "Rentas de Trabajo con 25% Exento (Casillas 32-36)"
+        c32, c33, c34 = trab_bruto_tot, inc_trab_tot, c34_a
         c43, c44, c45, c46 = 0, 0, 0, 0
-        c91, c36, ben_40, sol_40, rem_cg = c91_a, exenta_25_a + ces_ex, aceptados_40_a, solicitados_a, rem_a
+        c91, c36, ben_40, sol_40, rem_cg = c91_a, ex25_a + ces_ex, acep_a, ded_comunes + ex25_a, rem_a
 
-    # 4. BENEFICIOS FUERA DEL LÍMITE DEL 40%
     fe_pot = redondear_dian(min(d["compras_factura_electronica"] * 0.01, 240 * uvt))
-    c28 = fe_pot if d.get("aplicar_beneficio_fe", False) else 0
+    c28 = fe_pot if d["aplicar_beneficio_fe"] else 0
     c139 = redondear_dian(min(int(d["num_dependientes"]), 4) * 72 * uvt) if hay_trab else 0
     fuera_40 = min(rem_cg, c28 + c139)
 
     c92 = ben_40 + fuera_40
     c97 = max(0, c91 - c92)
 
-    # 5. PENSIONES, DIVIDENDOS Y GANANCIAS OCASIONALES
     c99 = redondear_dian(d["ing_brutos_pensiones"])
     c100 = min(c99, redondear_dian(d["salud_pensiones"]))
     pen_liq = max(0, c99 - c100)
@@ -383,15 +375,14 @@ def liquidar_210(d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, 
     c107 = redondear_dian(d["dividendos_gravables"])
     c111 = c97 + c103 + c107
 
-    go_act_b = redondear_dian(d["ing_ganancia_ocasional"])
-    go_lot_b = redondear_dian(d.get("ing_loterias_rifas", 0.0))
-    c112 = go_act_b + go_lot_b
+    go_act = redondear_dian(d["ing_ganancia_ocasional"])
+    go_lot = redondear_dian(d["ing_loterias_rifas"])
+    c112 = go_act + go_lot
     c113 = redondear_dian(d["costos_ganancia_ocasional"])
     c114 = redondear_dian(d["exenta_ganancia_ocasional"])
-    go_act_grav = max(0, go_act_b - c113 - c114)
-    c115 = go_act_grav + go_lot_b
+    go_act_grav = max(0, go_act - c113 - c114)
+    c115 = go_act_grav + go_lot
 
-    # 6. EVALUACIÓN DE LOS 6 TOPES DIAN
     ing_tot = ing_brutos_cg + c99 + c107 + c112
     t_pat, t_ing = uvt_pat * uvt, uvt_ing * uvt
     causales = []
@@ -408,13 +399,12 @@ def liquidar_210(d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, 
     if d["responsable_iva"]:
         causales.append("Responsable de IVA")
 
-    # 7. LIQUIDACIÓN DE IMPUESTO Y ANTICIPO
     c116 = redondear_dian(impuesto_art241(c111, uvt))
-    desc_don = redondear_dian(d.get("donaciones_entidades", 0.0) * 0.25)
+    desc_don = redondear_dian(d["donaciones_entidades"] * 0.25)
     desc_div = redondear_dian(max(0.0, (c107 - (1_090 * uvt)) * 0.19)) if c107 > (1_090 * uvt) else 0
     c125 = min(c116, desc_don + desc_div)
     c126 = max(0, c116 - c125)
-    c127 = redondear_dian((go_act_grav * 0.15) + (go_lot_b * 0.20))
+    c127 = redondear_dian((go_act_grav * 0.15) + (go_lot * 0.20))
     c129 = c126 + c127
 
     c130 = redondear_dian(d["anticipo_anio_anterior"])
@@ -436,11 +426,12 @@ def liquidar_210(d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, 
     if mora > 0:
         s_min = redondear_dian(10 * uvt_san)
         bruta = min(c129, c129 * 0.05 * mora) if c129 > 0 else min(ing_tot * 0.05, ing_tot * 0.005 * mora)
-        if d.get("aplica_reduccion_640", False):
+        if d["aplica_reduccion_640"]:
             bruta *= 0.50
         c135 = max(s_min, redondear_dian(bruta))
 
     alivios = c130 + c131 + c132
+    c134 = max(0, c129 + c133 - alivios)
     bal = c129 + c133 + c135 - alivios
     c136, c137 = max(0, bal), abs(min(0, bal))
 
@@ -448,14 +439,11 @@ def liquidar_210(d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, 
     pat_ant = redondear_dian(d["patrimonio_liquido_anterior"])
     if pat_ant > 0 and (c31 - pat_ant) > (ing_netos_cg + pen_liq + c115 - imp_ant):
         dif_p = redondear_dian((c31 - pat_ant) - (ing_netos_cg + pen_liq + c115 - imp_ant))
-        alertas.append(f"Comparación Patrimonial (Art. 236 E.T.): Patrimonio creció ${dif_p:,.0f} por encima de ingresos netos justificables.")
+        alertas.append(f"Comparación Patrimonial (Art. 236 E.T.): Patrimonio creció ${dif_p:,.0f} por encima de ingresos netos.")
     if hay_trab and inc_trab_tot == 0:
         sugerencias.append("Recuerda cargar tus planillas PILA en el Paso 1 o digitar Salud y Pensión en el Paso 3.")
-    if fe_pot > 0 and not d.get("aplicar_beneficio_fe", False):
+    if fe_pot > 0 and not d["aplicar_beneficio_fe"]:
         sugerencias.append(f"Puedes restar ${fe_pot:,.0f} adicionales en Casilla 28 (1% Factura Electrónica) activándolo en el Paso 4.")
-    cupo_40 = max(0, lim_40 - sol_40)
-    if cupo_40 > 300_000 and c126 > 0:
-        sugerencias.append(f"Aún tienes ${cupo_40:,.0f} de cupo libre en la bolsa del 40% para reducir tu impuesto (ej. intereses de vivienda o medicina prepagada).")
 
     return {
         "obligado": len(causales) > 0, "estado": "Sí obligado a declarar" if causales else "No obligado a declarar",
@@ -469,13 +457,12 @@ def liquidar_210(d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, 
         "c92": c92, "c97": c97, "c99": c99, "c100": c100, "c102": c102, "c103": c103, "c107": c107,
         "c111": c111, "c112": c112, "c113": c113, "c114": c114, "c115": c115, "c116": c116, "c125": c125,
         "c126": c126, "c127": c127, "c129": c129, "c130": c130, "c131": c131, "c132": c132, "c133": c133,
-        "c134": max(0, c129 + c133 - alivios), "c135": c135, "c136": c136, "c137": c137, 
-        "c138": int(d["num_dependientes"]), "c139": c139,
+        "c134": c134, "c135": c135, "c136": c136, "c137": c137, "c138": int(d["num_dependientes"]), "c139": c139,
     }
 
 
 # ==============================================================================
-# 4. LECTORES BLINDADOS: EXÓGENA + PILA + SOPORTES (Sin Pydantic para Vertex AI)
+# 4. LECTORES CON CACHÉ SHA-256 + LOTE 1 CONSULTA + RESPALDO LOCAL PDF/OCR
 # ==============================================================================
 CAMPOS_SOPORTE = [
     "efectivo_bancos_dic31", "valor_inmueble_o_cdt_dic31", "saldo_deuda_dic31",
@@ -484,6 +471,7 @@ CAMPOS_SOPORTE = [
     "intereses_vivienda", "medicina_prepagada", "gmf_4x1000_certificado",
     "aportes_afc_fpv", "retenciones_practicadas",
 ]
+
 
 def _nvl(val) -> float:
     try:
@@ -495,6 +483,7 @@ def _nvl(val) -> float:
         return float(val)
     except Exception:
         return 0.0
+
 
 def _cop_txt(s: str) -> float:
     s = str(s).strip().replace("$", "").replace("COP", "").replace(" ", "")
@@ -514,7 +503,18 @@ def _cop_txt(s: str) -> float:
         return 0.0
 
 
+def validar_archivo_soporte(nombre: str, b: bytes, mime: str) -> None:
+    if not b:
+        raise ValueError(f"El archivo '{nombre}' está vacío.")
+    mime_permitidos = {"application/pdf", "image/png", "image/jpeg", "image/jpg"}
+    if mime not in mime_permitidos:
+        raise ValueError(f"Tipo de archivo no admitido en '{nombre}': {mime or 'desconocido'}.")
+    if len(b) > 20 * 1024 * 1024:
+        raise ValueError(f"El archivo '{nombre}' supera los 20 MB permitidos.")
+
+
 def extraer_texto_hibrido(b: bytes, mime: str) -> str:
+    """Extrae texto nativo del PDF o aplica OCR local si es escaneado/imagen (evita enviar binarios pesados)."""
     if mime == "application/pdf":
         try:
             lector = pypdf.PdfReader(io.BytesIO(b))
@@ -539,6 +539,7 @@ def extraer_texto_hibrido(b: bytes, mime: str) -> str:
 
 
 def parsear_json_soportes(texto_raw: str) -> List[dict]:
+    """Limpia bloques markdown y normaliza null/vacíos a 0.0 para evitar errores numéricos."""
     limpio = (texto_raw or "").strip()
     limpio = re.sub(r"^```(?:json)?\s*", "", limpio, flags=re.IGNORECASE)
     limpio = re.sub(r"\s*```$", "", limpio)
@@ -567,6 +568,7 @@ def parsear_json_soportes(texto_raw: str) -> List[dict]:
 
 
 def extraer_soporte_nativo_sin_ia(nombre: str, b: bytes, mime: str) -> dict:
+    """Extractor local instantáneo (PDF + OCR) 100% libre de cuotas de IA."""
     texto = extraer_texto_hibrido(b, mime)
     t_clean = re.sub(r"[ \t]+", " ", texto or "")
     lineas = [l.strip() for l in t_clean.splitlines() if l.strip()]
@@ -584,9 +586,13 @@ def extraer_soporte_nativo_sin_ia(nombre: str, b: bytes, mime: str) -> dict:
             entidad = nom_b
             break
 
+    es_220 = "220" in tl and ("ingresos y retenciones" in tl or "pagos laborales" in tl)
+    es_cdt = "cdt" in tl or "deposito a termino" in tl
+    es_predial = "predial" in tl or "avaluo catastral" in tl
+
     res = {
         "archivo": nombre,
-        "tipo_documento": "Formulario 220" if "220" in tl and "laborales" in tl else ("Certificado CDT" if "cdt" in tl else ("Predial" if "predial" in tl else "Certificado Tributario")),
+        "tipo_documento": "Formulario 220" if es_220 else ("Certificado CDT" if es_cdt else ("Predial" if es_predial else "Certificado Tributario")),
         "entidad": entidad,
     }
     for c in CAMPOS_SOPORTE:
@@ -607,7 +613,7 @@ def extraer_soporte_nativo_sin_ia(nombre: str, b: bytes, mime: str) -> dict:
         elif ("componente inflacionario" in ll or "parte no gravada" in ll) and ("$" in l or "%" not in l):
             res["componente_inflacionario_cdt"] = max(res["componente_inflacionario_cdt"], montos[-1])
         elif any(k in ll for k in ["saldo a 31 de diciembre", "saldo al 31 de diciembre", "saldo dic 31", "saldo a dic", "saldo capital a 31"]):
-            if "cdt" in tl or "cdt" in ll:
+            if es_cdt or "cdt" in ll:
                 res["valor_inmueble_o_cdt_dic31"] = max(res["valor_inmueble_o_cdt_dic31"], montos[-1])
             elif any(w in ll for w in ["deuda", "hipotec", "obligacion", "tarjeta"]):
                 res["saldo_deuda_dic31"] = max(res["saldo_deuda_dic31"], abs(montos[-1]))
@@ -622,12 +628,12 @@ def extraer_soporte_nativo_sin_ia(nombre: str, b: bytes, mime: str) -> dict:
 
 
 def extraer_pendientes_con_ia(api_key: str, pendientes: List[Tuple[Any, bytes, str]]) -> List[dict]:
+    """Envía solo los certificados nuevos en 1 SOLA consulta ligera (compatible con Vertex 'AQ.' y 'AIza')."""
     bloques_texto = []
     partes_visuales: List[Any] = []
 
     for fc, b, _ in pendientes:
-        if len(b) > 20 * 1024 * 1024:
-            raise ValueError(f"El archivo '{fc.name}' supera los 20 MB permitidos.")
+        validar_archivo_soporte(fc.name, b, fc.type)
         txt = extraer_texto_hibrido(b, fc.type)
         if len(txt) >= 30:
             bloques_texto.append(f"=== ARCHIVO_ID: {fc.name} ===\n{txt[:9500]}")
@@ -685,7 +691,7 @@ def leer_pila_pdf(nombre: str, b: bytes) -> dict:
                     break
             break
 
-    salud, pension, arl, total_pagado = 0.0, 0.0, 0.0, 0.0
+    salud, pension, arl = 0.0, 0.0, 0.0
     for idx, l in enumerate(lineas):
         ll = l.lower().replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
         nums = []
@@ -702,30 +708,6 @@ def leer_pila_pdf(nombre: str, b: bytes) -> dict:
             pension = nums[0]
         elif ll in ("riesgos laborales", "riesgos profesionales", "arl") and nums and arl == 0:
             arl = nums[0]
-        elif ll == "totales" and nums and total_pagado == 0:
-            total_pagado = nums[-1]
-
-    if salud == 0 or pension == 0:
-        for l in lineas:
-            ll = l.lower().replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
-            montos = [_cop_txt(m) for m in re.findall(r"\$\s*\d{1,3}(?:[.,]\d{3})+|\b\d{1,3}(?:\.\d{3})+\b", l)]
-            montos = [n for n in montos if 2_000 <= n <= 35_000_000]
-            if not montos:
-                continue
-            if salud == 0 and ("salud" in ll or "eps" in ll) and "periodo" not in ll:
-                salud = montos[-1]
-            elif pension == 0 and ("pension" in ll or "afp" in ll or "colpensiones" in ll) and "periodo" not in ll:
-                pension = montos[-1]
-            elif arl == 0 and ("riesgos laborales" in ll or "positiva" in ll or "sura" in ll):
-                arl = montos[-1]
-
-    if total_pagado == 0:
-        for l in lineas:
-            if l.startswith("$"):
-                val_p = _cop_txt(l)
-                if val_p > 0:
-                    total_pagado = val_p
-                    break
 
     return {"es_pila": (salud + pension) > 0, "planilla": planilla, "periodo": periodo, "salud": salud, "pension": pension, "arl": arl}
 
@@ -800,14 +782,6 @@ def procesar_exogena(b: bytes, anio_ref: int) -> Tuple[pd.DataFrame, Dict[str, A
         val = _nvl(row.get(c_val, 0))
         if val == 0:
             continue
-        if not res["nit"] and len(row) >= 4:
-            pos_doc = str(row.iloc[2] or "").strip().split(".")[0]
-            pos_nom = str(row.iloc[3] or "").strip()
-            if pos_doc.isdigit() and len(pos_doc) >= 6:
-                res["nit"] = pos_doc
-            if len(pos_nom) >= 5 and "nan" not in pos_nom.lower():
-                res["nombre"] = pos_nom
-
         nit_r = str(row.get(c_nit_r, "") or "").strip().split(".")[0]
         dn = str(row.get(c_det, "") or "").lower().replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
         un = (str(row.get(c_uso, "") or "").lower() if c_uso else "").replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
@@ -821,7 +795,7 @@ def procesar_exogena(b: bytes, anio_ref: int) -> Tuple[pd.DataFrame, Dict[str, A
         elif "tope 4" in un or "movimientos en cuentas" in dn or "inversion efectuada" in dn:
             res["consignaciones"] += val
         elif "tope 2" in un or "r29" in un or "saldo cuentas" in dn or "saldo cdt" in dn:
-            if val < 0 or ("r30" in un and "r29" not in un) or "pasivo" in dn or "deuda" in dn:
+            if val < 0 or ("r30" in un and "r29" not in un) or "deuda" in dn or "pasivo" in dn:
                 res["deudas"] += abs(val)
             elif any(k in dn for k in ["cdt", "inversion", "accion", "fiducia", "fondo"]):
                 res["cdt_saldo"] += val
@@ -838,9 +812,9 @@ def procesar_exogena(b: bytes, anio_ref: int) -> Tuple[pd.DataFrame, Dict[str, A
             por_nit[nit_r]["ds"] += (-val if (dn.startswith("ajuste") or "descuenta automaticamente" in un) else val)
         elif "r33" in un or "r44" in un or "salud obligatoria" in dn or "pension obligatoria" in dn:
             res["salud_pen"] += val
-        elif "r38" in un or "intereses de vivienda" in dn or "credito hipotecario" in dn:
+        elif "r38" in un or "vivienda" in dn:
             res["vivienda"] += val
-        elif "r39" in un or "prepagada" in dn or "poliza de salud" in dn:
+        elif "r39" in un or "prepagada" in dn:
             res["prepagada"] += val
         elif "gmf" in dn or "4x1000" in dn:
             res["gmf"] += val
@@ -867,10 +841,8 @@ def procesar_exogena(b: bytes, anio_ref: int) -> Tuple[pd.DataFrame, Dict[str, A
         res["compras"] = topes_ofi["5"]
     if "3" in topes_ofi:
         res["tc"] = topes_ofi["3"]
-
-    anio_ref = anio_m or anio_ref
     if res["ing_cap"] > 0:
-        res["inc_cap"] = float(redondear_dian(res["ing_cap"] * COMP_INFLACIONARIO.get(anio_ref, 0.5544)))
+        res["inc_cap"] = float(redondear_dian(res["ing_cap"] * COMP_INFLACIONARIO.get(anio_m or anio_ref, 0.5544)))
 
     for c in df_ter.columns:
         df_ter[c] = df_ter[c].apply(_nvl) if c == c_val else df_ter[c].apply(lambda x: "" if pd.isna(x) else str(x).strip())
@@ -981,7 +953,7 @@ def generar_word(r: dict, d: dict, anio: int, uvt: float) -> bytes:
 
 
 # ==============================================================================
-# 6. INTERFAZ PRINCIPAL BLINDADA (v5.5 OFICIAL DIAN)
+# 6. INTERFAZ PRINCIPAL BLINDADA (v5.4 FUSIÓN PRO)
 # ==============================================================================
 if not verificar_acceso():
     st.stop()
@@ -1015,12 +987,12 @@ d = st.session_state.datos
 
 with st.sidebar:
     st.title("⚙️ Configuración DIAN")
-    st.caption("Versión **v5.6 Definitiva** • ARL Casilla 33 Activa")
+    st.caption("Versión **v5.4 Fusión Pro** • Caché SHA-256 + Lote IA + Respaldo Local")
 
     sec_key = obtener_secreto("GEMINI_API_KEY")
     if sec_key:
         api_key = sec_key
-        modo_txt = "Vertex Express" if sec_key.startswith("AQ.") else "AI Studio"
+        modo_txt = "Vertex AI" if sec_key.startswith("AQ.") else "AI Studio"
         st.success(f"🔒 Gemini conectada — {modo_txt} ({sec_key[:3]}...{sec_key[-4:]})")
     else:
         st.warning("⚠️ Sin clave en Secrets. Pégala abajo si vas a usar IA:")
@@ -1073,6 +1045,13 @@ with st.sidebar:
             st.session_state.form_id += 1
             st.rerun()
 
+    clave_m = obtener_secreto("CLAVE_MAESTRA")
+    if clave_m and st.session_state.get("es_admin", False):
+        with st.expander("🛡️ Licencias Clientes"):
+            cli = st.text_input("Cédula o Correo")
+            if cli:
+                st.code(generar_licencia(cli, clave_m))
+
     st.divider()
     with st.popover("🧹 Nueva Declaración / Limpiar Todo", use_container_width=True):
         st.warning("¿Borrar todos los datos y archivos actuales?")
@@ -1105,7 +1084,7 @@ t1, t2, t3, t4, t5 = st.tabs([
 ])
 
 # ==============================================================================
-# PASO 1: EXÓGENA PERSISTENTE + PILA PERSISTENTE + SOPORTES CON IA O LOCAL
+# PASO 1: EXÓGENA PERSISTENTE + PILA PERSISTENTE + SOPORTES CON CACHÉ SHA-256
 # ==============================================================================
 with t1:
     c_izq, c_der = st.columns(2)
@@ -1132,7 +1111,7 @@ with t1:
                 ("Movimientos / Consignaciones (Tope 4)", f"${rs_e['consignaciones']:,.0f}"),
                 ("Compras Totales (Tope 5) / Base FE 1%", f"${rs_e['compras']:,.0f} / ${rs_e['fe_1pct']:,.0f}"),
                 ("Ingresos Trabajo + Honorarios/Servicios", f"${rs_e['ing_trab'] + rs_e['ing_hon']:,.0f}"),
-                ("Rendimientos CDT (C.58)", f"${rs_e['ing_cap']:,.0f}"),
+                ("Rendimientos CDT (C.58) / No Gravado (C.59)", f"${rs_e['ing_cap']:,.0f} / ${rs_e['inc_cap']:,.0f}"),
                 ("Retenciones en la Fuente (C.132)", f"${rs_e['retenciones']:,.0f}"),
             ], columns=["Concepto Detectado", "Valor"]))
 
@@ -1171,18 +1150,15 @@ with t1:
                 st.rerun()
 
             if st.button("🤖 Explicar mi Exógena con IA Gemini", use_container_width=True):
-                if not api_key:
-                    st.error("🔑 Guarda tu clave en Configuración -> Secrets o pégala en la barra lateral.")
-                else:
-                    try:
-                        with st.spinner("Analizando terceros..."):
-                            pr = f"Explica brevemente en español sencillo estos terceros de Exógena DIAN:\n{df_e.head(120).to_csv(index=False)}"
-                            st.session_state.auditoria_ia = llamar_gemini(api_key, pr, temperatura=0.1)
-                    except Exception as e:
-                        st.error(f"⚠️ {e}")
+                try:
+                    with st.spinner("Analizando terceros..."):
+                        pr = f"Explica brevemente en español sencillo estos terceros de Exógena DIAN:\n{df_e.head(120).to_csv(index=False)}"
+                        st.session_state.auditoria_ia = llamar_gemini(api_key, pr, temperatura=0.1)
+                except Exception as e:
+                    st.error(f"⚠️ {e}")
 
         if st.session_state.auditoria_ia:
-            st.success(st.session_state.auditoria_ia)
+            st.info(st.session_state.auditoria_ia)
 
     with c_der:
         st.subheader("🏥 B. Lector Masivo de Planillas PILA (Multi-PDF sin IA)")
@@ -1230,9 +1206,9 @@ with t1:
         if f_certs:
             bt_ia, bt_nat = st.columns(2)
 
-            if bt_ia.button(f"🤖 Extraer {len(f_certs)} en 1 llamada IA", type="primary", use_container_width=True):
+            if bt_ia.button(f"🤖 Extraer {len(f_certs)} con IA (Caché SHA-256)", type="primary", use_container_width=True):
                 if not api_key:
-                    st.error("🔑 Guarda tu clave `AIzaSy...` en Configuración -> Secrets o usa el botón de al lado 'Extraer SIN IA'.")
+                    st.error("🔑 Configura tu clave en Configuración -> Secrets o usa el botón de al lado 'Extraer SIN IA'.")
                 else:
                     resultados = {it["_sha256"]: it for it in st.session_state.mem_cert if it.get("_sha256")}
                     sin_huella = [it for it in st.session_state.mem_cert if not it.get("_sha256")]
@@ -1247,7 +1223,7 @@ with t1:
                         st.info("✅ Estos certificados ya están extraídos en memoria (0 consultas nuevas a Gemini).")
                     else:
                         try:
-                            with st.spinner(f"Procesando {len(pendientes)} soporte(s) nuevo(s) en 1 sola consulta IA..."):
+                            with st.spinner(f"Procesando {len(pendientes)} soporte(s) nuevo(s) en 1 sola llamada IA..."):
                                 lista_nuevos = extraer_pendientes_con_ia(api_key, pendientes)
                                 mapa_nombre = {it.get("archivo", ""): it for it in lista_nuevos}
                                 for idx_p, (arc, cont, h_sha) in enumerate(pendientes):
@@ -1313,7 +1289,7 @@ with t1:
 # PASO 2: PERFIL DIAN, PATRIMONIO Y DEUDAS
 # ==============================================================================
 with t2:
-    i1, i2, i3, i4 = st.columns([2.2, 1.3, 1.3, 1.8])
+    i1, i2, i3, i4 = st.columns([2.2, 1.2, 1.3, 1.8])
     d["nombre_declarante"] = i1.text_input("Nombre Completo (Casillas 7-10)", value=d["nombre_declarante"], key=f"nm_{fid}")
     d["nit_declarante"] = i2.text_input("Cédula / NIT sin DV (Casilla 5)", value=d["nit_declarante"], key=f"nt_{fid}")
     i2.caption(f"DV automático (Casilla 6): **{calcular_dv(d['nit_declarante']) or '-'}**")
@@ -1322,29 +1298,13 @@ with t2:
     sel_c = i4.selectbox("Actividad Económica CIIU (Casilla 24)", ACTIVIDADES_CIIU, index=cods_c.index(d["cod_actividad"]) if d["cod_actividad"] in cods_c else len(ACTIVIDADES_CIIU) - 1, key=f"ci_{fid}")
     d["cod_actividad"] = i4.text_input("Código CIIU manual", value=d["cod_actividad"], key=f"cm_{fid}") if sel_c.startswith("OTRO") else sel_c.split(" - ")[0]
 
-    info_venc = orientacion_vencimiento_dian(d["nit_declarante"], anio_gravable + 1)
-    if info_venc:
-        st.caption(f"🗓️ {info_venc} — Verifica el día exacto en el calendario tributario oficial de la DIAN.")
-
     st.divider()
     p1, p2 = st.columns(2)
     with p1:
         st.subheader(f"Patrimonio y Deudas a 31 de Diciembre de {anio_gravable}")
         d["efectivo"] = st.number_input("🏦 Saldos en cuentas bancarias, Nequi, Daviplata y efectivo", min_value=0.0, value=float(d["efectivo"]), step=100_000.0, key=f"ef_{fid}")
         d["otros_activos"] = st.number_input("📈 CDTs vigentes a dic 31, fiducias, acciones y cuentas por cobrar", min_value=0.0, value=float(d["otros_activos"]), step=200_000.0, key=f"oa_{fid}")
-        
-        with st.expander("🏡 Asistente DIAN para Inmuebles: Comparar Compra vs. Predial (Art. 277 E.T.)"):
-            st.caption("La DIAN exige declarar cada inmueble por el **mayor valor** entre el precio de compra (escritura) y el avalúo catastral del recibo Predial.")
-            ca1, ca2 = st.columns(2)
-            costo_esc = ca1.number_input("Precio de compra / Costo fiscal ($)", min_value=0.0, step=1_000_000.0, key=f"esc_{fid}")
-            avaluo_pred = ca2.number_input("Avalúo Catastral recibo Predial ($)", min_value=0.0, step=1_000_000.0, key=f"pred_{fid}")
-            mayor_inm = max(costo_esc, avaluo_pred)
-            if mayor_inm > 0 and st.button(f"➕ Sumar mayor valor oficial (${mayor_inm:,.0f}) a Bienes Raíces", use_container_width=True):
-                d["inmuebles"] += float(mayor_inm)
-                st.session_state.form_id += 1
-                st.rerun()
-
-        d["inmuebles"] = st.number_input("🏠 Total Bienes Raíces: Casas, lotes, apartamentos (Mayor entre escritura y predial)", min_value=0.0, value=float(d["inmuebles"]), step=1_000_000.0, key=f"in_{fid}")
+        d["inmuebles"] = st.number_input("🏠 Bienes Raíces: Casas, lotes, apartamentos (Mayor entre escritura y predial)", min_value=0.0, value=float(d["inmuebles"]), step=1_000_000.0, key=f"in_{fid}")
         d["vehiculos"] = st.number_input("🚗 Vehículos, motos y otros bienes (Precio de compra)", min_value=0.0, value=float(d["vehiculos"]), step=500_000.0, key=f"vh_{fid}")
         d["deudas"] = st.number_input("💳 Total Deudas vigentes a dic 31 (Hipotecas, bancos, tarjetas — Casilla 30)", min_value=0.0, value=float(d["deudas"]), step=200_000.0, key=f"de_{fid}")
     with p2:
@@ -1353,20 +1313,6 @@ with t2:
         d["tarjetas_credito"] = st.number_input("Consumos con Tarjeta de Crédito (Tope 3)", min_value=0.0, value=float(d["tarjetas_credito"]), step=500_000.0, key=f"tc_{fid}")
         d["compras_totales"] = st.number_input("Compras y consumos totales del año (Tope 5)", min_value=0.0, value=float(d["compras_totales"]), step=500_000.0, key=f"cp_{fid}")
         d["responsable_iva"] = st.toggle("¿Responsable de IVA a 31 de diciembre?", value=bool(d["responsable_iva"]), key=f"iv_{fid}")
-        
-        res_parcial = liquidar_210(d, valor_uvt, uvt_pat, uvt_ing, uvt_san)
-        st.markdown("**Progreso frente a los Topes DIAN para estar obligado a declarar:**")
-        for nombre_t, actual_t, limite_t in [
-            ("Patrimonio Bruto", res_parcial["c29"], res_parcial["t_pat"]),
-            ("Ingresos Brutos", res_parcial["ing_tot"], res_parcial["t_ing"]),
-            ("Consignaciones / Inversiones", d["consignaciones"], res_parcial["t_ing"]),
-            ("Compras / Tarjetas", max(d["compras_totales"], d["tarjetas_credito"]), res_parcial["t_ing"]),
-        ]:
-            pct_t = min(1.0, (actual_t / limite_t) if limite_t > 0 else 0.0)
-            icono_t = "🔴 Supera tope" if actual_t >= limite_t else "🟢 Bajo el tope"
-            st.progress(pct_t, text=f"{icono_t} — {nombre_t}: ${actual_t:,.0f} / Tope: ${limite_t:,.0f}")
-            
-        st.divider()
         d["patrimonio_liquido_anterior"] = st.number_input("Patrimonio Líquido declaración año anterior (Opcional — Art. 236)", min_value=0.0, value=float(d["patrimonio_liquido_anterior"]), step=500_000.0, key=f"pa_{fid}")
 
 # ==============================================================================
@@ -1387,15 +1333,6 @@ with t3:
         ca1, ca2 = st.columns(2)
         d["arl_honorarios"] = ca1.number_input("ARL Riesgos Laborales", min_value=0.0, value=float(d["arl_honorarios"]), step=10_000.0, key=f"arl_{fid}")
         d["costos_honorarios"] = ca2.number_input("Otros costos con factura", min_value=0.0, value=float(d["costos_honorarios"]), step=100_000.0, key=f"ch_{fid}")
-
-        if d["ing_brutos_honorarios"] > 0:
-            res_parcial_p3 = liquidar_210(d, valor_uvt, uvt_pat, uvt_ing, uvt_san)
-            st.info(
-                f"🤖 **Comparador Automático DIAN:**\n"
-                f"- Base gravable usando **25% Renta Exenta (Casilla 32)**: `${res_parcial_p3['rem_25']:,.0f}`\n"
-                f"- Base gravable usando **Costos + ARL (Casillas 43-46)**: `${res_parcial_p3['rem_costos']:,.0f}`\n"
-                f"👉 El sistema aplicó automáticamente: **{res_parcial_p3['estrategia']}**"
-            )
 
     with g2:
         st.subheader("🏦 3. Rentas de Capital: CDTs, Intereses y Arriendos")
