@@ -101,11 +101,38 @@ def calcular_dv(nit_str: str) -> str:
     return str(res if res in (0, 1) else 11 - res)
 
 
+def normalizar_entidad(texto: str) -> str:
+    """Unifica nombres y NITs bancarios/terceros para evitar duplicados entre Exógena y PDFs."""
+    t = (texto or "").lower()
+    t = t.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
+    if any(k in t for k in ("bbva", "bilbao", "860003020")):
+        return "BBVA Colombia"
+    if any(k in t for k in ("bogota", "860002964")):
+        return "Banco de Bogotá"
+    if any(k in t for k in ("bancolombia", "890903938")):
+        return "Bancolombia"
+    if any(k in t for k in ("davivienda", "860034313")):
+        return "Davivienda"
+    if any(k in t for k in ("colpatria", "scotiabank", "860034594")):
+        return "Scotiabank Colpatria"
+    if any(k in t for k in ("occidente", "890300279")):
+        return "Banco de Occidente"
+    if any(k in t for k in ("popular", "860007738")):
+        return "Banco Popular"
+    if any(k in t for k in ("av villas", "860035827")):
+        return "Banco AV Villas"
+    if "nequi" in t:
+        return "Nequi"
+    if "daviplata" in t:
+        return "Daviplata"
+    limpio = re.sub(r"\s+", " ", (texto or "Otra Entidad")).strip()
+    return limpio or "Otra Entidad"
+
+
 # ==============================================================================
 # 2. SEGURIDAD Y CONEXIÓN GEMINI INTELIGENTE ('AIza...' + 'AQ....' + GEMINI 3.x)
 # ==============================================================================
 def limpiar_key(raw: str) -> str:
-    """Acepta claves estándar (AIza...) y nuevas Auth Keys de AI Studio / Vertex (AQ....)."""
     if not raw:
         return ""
     txt = str(raw).strip()
@@ -162,10 +189,6 @@ def verificar_acceso() -> bool:
 
 
 def crear_clientes_gemini(llave: str) -> List[Tuple[str, Any]]:
-    """
-    Google AI Studio ahora también emite claves con prefijo 'AQ.'.
-    Por ello se prioriza AIStudio primero y se deja VertexAI como respaldo automático.
-    """
     clientes: List[Tuple[str, Any]] = []
     try:
         clientes.append(("AIStudio", genai.Client(api_key=llave)))
@@ -180,7 +203,6 @@ def crear_clientes_gemini(llave: str) -> List[Tuple[str, Any]]:
 
 
 def _descubrir_modelos_activos(cli: Any, ya_probados: List[str]) -> List[str]:
-    """Si los modelos fijos dan 404 en el futuro, descubre dinámicamente los modelos activos de la cuenta."""
     excluidos = ("tts", "live", "image", "embed", "veo", "lyria", "robotics", "aqa", "imagen", "audio")
     hallados: List[str] = []
     try:
@@ -196,12 +218,11 @@ def _descubrir_modelos_activos(cli: Any, ya_probados: List[str]) -> List[str]:
             hallados.append(nom)
     except Exception:
         return []
-    hallados.sort(key=lambda x: (0 if "flash" in x.lower() else 1, x), reverse=False)
+    hallados.sort(key=lambda x: (0 if "flash" in x.lower() else 1, x))
     return hallados[:4]
 
 
 def _construir_config_gemini(modelo: str, system_instruction: str = None, temperatura: float = 0.0) -> types.GenerateContentConfig:
-    """Omite 'temperature' en modelos Gemini 3.x / alias latest donde el parámetro fue deprecado."""
     cfg_kwargs: Dict[str, Any] = {}
     if system_instruction:
         cfg_kwargs["system_instruction"] = system_instruction
@@ -217,7 +238,6 @@ def llamar_gemini(
     system_instruction: str = None,
     temperatura: float = 0.0,
 ) -> str:
-    """Consulta Gemini con modelos 3.x vigentes, auto-descubrimiento anti-404 y fallback AIStudio/Vertex."""
     llave = limpiar_key(api_key)
     if not llave:
         raise ValueError(
@@ -319,7 +339,7 @@ def datos_vacios() -> Dict[str, Any]:
         "patrimonio_liquido_anterior": 0.0,
         "ing_brutos_trabajo": 0.0, "salud_pension_trabajo": 0.0, "cesantias_exentas": 0.0,
         "ing_brutos_honorarios": 0.0, "salud_pension_honorarios": 0.0, "arl_honorarios": 0.0, "costos_honorarios": 0.0,
-        "ing_brutos_capital": 0.0, "incrngo_capital": 0.0, "costos_capital": 0.0,
+        "ing_brutos_capital": 0.0, "incrngo_capital": 0.0, "auto_comp_inflacionario": True, "costos_capital": 0.0,
         "ing_brutos_no_laborales": 0.0, "incrngo_no_laborales": 0.0, "costos_no_laborales": 0.0,
         "ing_brutos_pensiones": 0.0, "salud_pensiones": 0.0, "dividendos_gravables": 0.0,
         "ing_ganancia_ocasional": 0.0, "ing_loterias_rifas": 0.0, "costos_ganancia_ocasional": 0.0, "exenta_ganancia_ocasional": 0.0,
@@ -341,14 +361,21 @@ def impuesto_art241(rlg: float, uvt: float) -> float:
     return 0.0
 
 
-def liquidar_210(d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, uvt_san: float) -> Dict[str, Any]:
+def liquidar_210(
+    d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, uvt_san: float, anio_grav: int = 2025
+) -> Dict[str, Any]:
     pat_raw = d["efectivo"] + d["otros_activos"] + d["inmuebles"] + d["vehiculos"]
     c29 = redondear_dian(pat_raw)
     c30 = redondear_dian(d["deudas"])
     c31 = max(0, c29 - c30)
 
+    pct_inf = COMP_INFLACIONARIO.get(anio_grav, 0.5544)
     c58 = redondear_dian(d["ing_brutos_capital"])
-    c59 = min(c58, redondear_dian(d["incrngo_capital"]))
+    if d.get("auto_comp_inflacionario", True) and d["ing_brutos_capital"] > 0 and d["costos_capital"] == 0:
+        inc_cap_base = redondear_dian(d["ing_brutos_capital"] * pct_inf)
+    else:
+        inc_cap_base = redondear_dian(d["incrngo_capital"])
+    c59 = min(c58, inc_cap_base)
     neto_cap = max(0, c58 - c59)
     c60 = min(neto_cap, redondear_dian(d["costos_capital"]))
     c61 = max(0, neto_cap - c60)
@@ -360,8 +387,7 @@ def liquidar_210(d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, 
     c78 = max(0, neto_nl - c77)
 
     # Art. 55 y 56 E.T. + Concepto Unificado DIAN 0912 de 2018 (Descriptor 1.12):
-    # Los aportes obligatorios de EPS (Salud) + Pensión + ARL pagados por el independiente
-    # son Ingresos No Constitutivos de Renta (INCRNGO) y se suman antes de redondear la casilla.
+    # EPS (Salud) + Pensión + ARL pagados por el independiente son INCRNGO en Casilla 33 o 44.
     trab_bruto_tot = redondear_dian(d["ing_brutos_trabajo"] + d["ing_brutos_honorarios"])
     inc_trab_tot = min(
         trab_bruto_tot,
@@ -508,6 +534,13 @@ def liquidar_210(d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, 
     if pat_ant > 0 and (c31 - pat_ant) > (ing_netos_cg + pen_liq + c115 - imp_ant):
         dif_p = redondear_dian((c31 - pat_ant) - (ing_netos_cg + pen_liq + c115 - imp_ant))
         alertas.append(f"Comparación Patrimonial (Art. 236 E.T.): Patrimonio creció ${dif_p:,.0f} por encima de ingresos netos.")
+    if c58 > 0 and c60 == 0:
+        c59_esp = redondear_dian(d["ing_brutos_capital"] * pct_inf)
+        if abs(c59 - c59_esp) >= 2_000:
+            sugerencias.append(
+                f"Casilla 59 ({c59:,.0f}) difiere del {pct_inf*100:.2f}% oficial para rendimientos financieros (${c59_esp:,.0f}). "
+                "Verifica en el Paso 3 si Casilla 58 incluye arriendos o si debes activar el cálculo automático."
+            )
     if hay_trab and inc_trab_tot == 0:
         sugerencias.append("Recuerda cargar tus planillas PILA en el Paso 1 o digitar EPS, Pensión y ARL en el Paso 3.")
     if fe_pot > 0 and not d["aplicar_beneficio_fe"]:
@@ -532,7 +565,7 @@ def liquidar_210(d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, 
 
 
 # ==============================================================================
-# 4. LECTORES CON CACHÉ SHA-256 + LOTE 1 CONSULTA + RESPALDO LOCAL PDF/OCR
+# 4. LECTORES CON CACHÉ SHA-256 + DEDUPLICADOR DE BANCOS + CONCILIACIÓN EXÓGENA
 # ==============================================================================
 CAMPOS_SOPORTE = [
     "efectivo_bancos_dic31", "valor_inmueble_o_cdt_dic31", "saldo_deuda_dic31",
@@ -584,7 +617,6 @@ def validar_archivo_soporte(nombre: str, b: bytes, mime: str) -> None:
 
 
 def extraer_texto_hibrido(b: bytes, mime: str) -> str:
-    """Extrae texto nativo del PDF o aplica OCR local si es escaneado/imagen."""
     if mime == "application/pdf":
         try:
             lector = pypdf.PdfReader(io.BytesIO(b))
@@ -609,7 +641,6 @@ def extraer_texto_hibrido(b: bytes, mime: str) -> str:
 
 
 def parsear_json_soportes(texto_raw: str) -> List[dict]:
-    """Limpia bloques markdown y normaliza null/vacíos a 0.0 para evitar errores numéricos."""
     limpio = (texto_raw or "").strip()
     limpio = re.sub(r"^```(?:json)?\s*", "", limpio, flags=re.IGNORECASE)
     limpio = re.sub(r"\s*```$", "", limpio)
@@ -627,9 +658,10 @@ def parsear_json_soportes(texto_raw: str) -> List[dict]:
         if not isinstance(item, dict):
             continue
         reg = {
+            "incluir": True,
             "archivo": str(item.get("archivo") or "Soporte"),
             "tipo_documento": str(item.get("tipo_documento") or "Certificado"),
-            "entidad": str(item.get("entidad") or "Entidad"),
+            "entidad": normalizar_entidad(str(item.get("entidad") or "Entidad")),
         }
         for c in CAMPOS_SOPORTE:
             reg[c] = _nvl(item.get(c, 0.0))
@@ -637,33 +669,92 @@ def parsear_json_soportes(texto_raw: str) -> List[dict]:
     return salida
 
 
+def deduplicar_certificados_lote(registros: List[dict]) -> Tuple[List[dict], List[str]]:
+    """
+    Evita doble conteo cuando para un mismo banco el usuario sube el Certificado de Saldo/CDT
+    y simultáneamente el Certificado de Retención en la Fuente (que repite la base del rendimiento).
+    """
+    avisos: List[str] = []
+    limpios = [dict(r) for r in registros]
+    por_entidad: Dict[str, List[dict]] = {}
+
+    for r in limpios:
+        r["incluir"] = bool(r.get("incluir", True))
+        r["entidad"] = normalizar_entidad(r.get("entidad", ""))
+        por_entidad.setdefault(r["entidad"], []).append(r)
+
+    campos_base = [
+        "efectivo_bancos_dic31", "valor_inmueble_o_cdt_dic31", "saldo_deuda_dic31",
+        "ingresos_brutos_trabajo", "ingresos_brutos_honorarios", "ingresos_capital_cdt",
+        "componente_inflacionario_cdt",
+    ]
+
+    def _es_doc_retefuente(doc: dict) -> bool:
+        etiqueta = f"{doc.get('tipo_documento', '')} {doc.get('archivo', '')}".lower()
+        return any(k in etiqueta for k in ("retefuente", "retencion", "retención")) and "220" not in etiqueta
+
+    for ent, docs in por_entidad.items():
+        if len(docs) < 2:
+            continue
+        principales = [x for x in docs if not _es_doc_retefuente(x)]
+        retes = [x for x in docs if _es_doc_retefuente(x)]
+
+        if principales and retes:
+            for c in campos_base:
+                suma_prin = sum(_nvl(p.get(c, 0)) for p in principales)
+                if suma_prin > 0:
+                    for rt in retes:
+                        val_rt = _nvl(rt.get(c, 0))
+                        if val_rt > 0:
+                            avisos.append(
+                                f"Anti-duplicado ({ent}): se ignoró base repetida de ${val_rt:,.0f} en '{rt.get('archivo')}' porque ya viene en el certificado principal."
+                            )
+                            rt[c] = 0.0
+
+        for c in ("retenciones_practicadas", "efectivo_bancos_dic31"):
+            vistos = set()
+            for doc in docs:
+                v = round(_nvl(doc.get(c, 0)), 2)
+                if v > 0:
+                    if v in vistos:
+                        avisos.append(
+                            f"Anti-duplicado ({ent}): valor idéntico repetido de ${v:,.0f} en '{c}' ({doc.get('archivo')}) ajustado a $0."
+                        )
+                        doc[c] = 0.0
+                    else:
+                        vistos.add(v)
+
+    return limpios, avisos
+
+
 def extraer_soporte_nativo_sin_ia(nombre: str, b: bytes, mime: str) -> dict:
-    """Extractor local instantáneo (PDF + OCR) 100% libre de cuotas de IA."""
     texto = extraer_texto_hibrido(b, mime)
     t_clean = re.sub(r"[ \t]+", " ", texto or "")
     lineas = [l.strip() for l in t_clean.splitlines() if l.strip()]
     tl = t_clean.lower().replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
 
-    entidad = "Entidad Detectada"
-    for k_b, nom_b in [
-        ("bbva", "BBVA Colombia"), ("bilbao vizcaya", "BBVA Colombia"),
-        ("bancolombia", "Bancolombia"), ("davivienda", "Davivienda"),
-        ("bogota", "Banco de Bogotá"), ("nequi", "Nequi"), ("daviplata", "Daviplata"),
-        ("colpatria", "Scotiabank Colpatria"), ("occidente", "Banco de Occidente"),
-        ("popular", "Banco Popular"), ("av villas", "Banco AV Villas"),
-    ]:
-        if k_b in tl:
-            entidad = nom_b
-            break
+    entidad = normalizar_entidad(tl) if any(
+        k in tl for k in ("bbva", "bilbao", "bancolombia", "davivienda", "bogota", "nequi", "daviplata", "colpatria", "occidente", "popular", "av villas")
+    ) else "Entidad Detectada"
 
+    nom_low = nombre.lower()
     es_220 = "220" in tl and ("ingresos y retenciones" in tl or "pagos laborales" in tl)
-    es_cdt = "cdt" in tl or "deposito a termino" in tl
+    es_solo_rete = (
+        any(k in nom_low for k in ("retefuente", "retencion", "retención"))
+        or ("certificado de retencion" in tl and "saldo a 31" not in tl and not es_220)
+    )
+    es_cdt = ("cdt" in tl or "deposito a termino" in tl) and not es_solo_rete
     es_predial = "predial" in tl or "avaluo catastral" in tl
 
     res = {
+        "incluir": True,
         "archivo": nombre,
         "tipo_documento": (
-            "Formulario 220" if es_220 else ("Certificado CDT" if es_cdt else ("Predial" if es_predial else "Certificado Tributario"))
+            "Formulario 220" if es_220 else (
+                "Certificado Retefuente" if es_solo_rete else (
+                    "Certificado CDT" if es_cdt else ("Predial" if es_predial else "Certificado Tributario")
+                )
+            )
         ),
         "entidad": entidad,
     }
@@ -680,7 +771,7 @@ def extraer_soporte_nativo_sin_ia(nombre: str, b: bytes, mime: str) -> dict:
             res["retenciones_practicadas"] = max(res["retenciones_practicadas"], montos[-1])
         elif any(k in ll for k in ["gravamen a los movimientos", "gmf", "4 x 1000", "4x1000", "cuatro por mil"]):
             res["gmf_4x1000_certificado"] = max(res["gmf_4x1000_certificado"], montos[-1])
-        elif any(k in ll for k in ["rendimientos financieros", "intereses pagados", "rendimientos pagados", "intereses abonados", "total rendimientos"]):
+        elif not es_solo_rete and any(k in ll for k in ["rendimientos financieros", "intereses pagados", "rendimientos pagados", "intereses abonados", "total rendimientos"]):
             res["ingresos_capital_cdt"] = max(res["ingresos_capital_cdt"], montos[-1])
         elif ("componente inflacionario" in ll or "parte no gravada" in ll) and ("$" in l or "%" not in l):
             res["componente_inflacionario_cdt"] = max(res["componente_inflacionario_cdt"], montos[-1])
@@ -693,14 +784,13 @@ def extraer_soporte_nativo_sin_ia(nombre: str, b: bytes, mime: str) -> dict:
                 res["efectivo_bancos_dic31"] = max(res["efectivo_bancos_dic31"], montos[-1])
         elif "avaluo catastral" in ll or "avaluo vigencia" in ll:
             res["valor_inmueble_o_cdt_dic31"] = max(res["valor_inmueble_o_cdt_dic31"], montos[-1])
-        elif ("honorarios" in ll or "servicios" in ll) and "retencion" not in ll:
+        elif not es_solo_rete and ("honorarios" in ll or "servicios" in ll) and "retencion" not in ll:
             res["ingresos_brutos_honorarios"] = max(res["ingresos_brutos_honorarios"], montos[-1])
 
     return res
 
 
 def extraer_pendientes_con_ia(api_key: str, pendientes: List[Tuple[Any, bytes, str]]) -> List[dict]:
-    """Envía solo los certificados nuevos en 1 SOLA consulta ligera."""
     bloques_texto = []
     partes_visuales: List[Any] = []
 
@@ -714,17 +804,21 @@ def extraer_pendientes_con_ia(api_key: str, pendientes: List[Tuple[Any, bytes, s
             partes_visuales.append(types.Part.from_bytes(data=b, mime_type=fc.type))
 
     instruccion = (
-        "Actúa como extractor de datos tributarios DIAN Colombia (no inventes valores). "
-        f"Debes devolver exactamente {len(pendientes)} elemento(s) en la lista 'documentos', uno por cada ARCHIVO_ID, "
-        "usando el nombre exacto de cada archivo en el campo 'archivo'. Responde SOLO con JSON válido así:\n"
-        '{"documentos": [{"archivo": "nombre.pdf", "tipo_documento": "CDT / Retefuente / Saldo / 220", '
-        '"entidad": "Entidad", "efectivo_bancos_dic31": 0, "valor_inmueble_o_cdt_dic31": 0, '
+        "Actúa como extractor contable DIAN Colombia (no inventes valores). "
+        f"Devuelve exactamente {len(pendientes)} elemento(s) en 'documentos', uno por cada ARCHIVO_ID, "
+        "usando el nombre exacto en 'archivo'. En 'tipo_documento' usa exactamente uno de: "
+        "'Certificado CDT', 'Certificado Saldo e Intereses', 'Certificado Retefuente', 'Formulario 220', 'Predial', 'Otro'.\n"
+        "REGLA CRÍTICA ANTI-DUPLICIDAD: Si un documento es únicamente un 'Certificado Retefuente' (certificado anual de retención en la fuente), "
+        "extrae SOLO 'retenciones_practicadas' y 'gmf_4x1000_certificado', y pon 0 en 'ingresos_capital_cdt' y 'ingresos_brutos_honorarios' "
+        "si en el lote ya vienen certificados de CDT/Saldo de esa misma entidad (para no duplicar la base sujeta a retención).\n"
+        "Responde SOLO con JSON válido:\n"
+        '{"documentos": [{"archivo": "nombre.pdf", "tipo_documento": "Certificado CDT", '
+        '"entidad": "BBVA Colombia", "efectivo_bancos_dic31": 0, "valor_inmueble_o_cdt_dic31": 0, '
         '"saldo_deuda_dic31": 0, "ingresos_brutos_trabajo": 0, "cesantias_exentas": 0, '
         '"ingresos_brutos_honorarios": 0, "salud_pension_obligatoria": 0, "ingresos_capital_cdt": 0, '
         '"componente_inflacionario_cdt": 0, "intereses_vivienda": 0, "medicina_prepagada": 0, '
         '"gmf_4x1000_certificado": 0, "aportes_afc_fpv": 0, "retenciones_practicadas": 0}]}\n'
-        "Usa 0 en cualquier campo que no aparezca. Si un CDT venció y su saldo al 31 de diciembre es $0, "
-        "registra 0 en 'valor_inmueble_o_cdt_dic31' y extrae intereses pagados, componente inflacionario y retención."
+        "Si el componente inflacionario aparece solo como porcentaje (ej. 55.44%) y no en pesos, pon 0 en 'componente_inflacionario_cdt'."
     )
 
     if not partes_visuales:
@@ -828,6 +922,7 @@ def procesar_exogena(b: bytes, anio_ref: int) -> Tuple[pd.DataFrame, Dict[str, A
 
     df = df.dropna(how="all").reset_index(drop=True)
     c_nit_r = df.columns[0]
+    c_nom_r = df.columns[1] if len(df.columns) > 1 else df.columns[0]
     c_det = next((c for c in df.columns if "detalle" in c.lower()), df.columns[min(4, len(df.columns) - 1)])
     c_val = next((c for c in df.columns if "valor" in c.lower()), df.columns[min(5, len(df.columns) - 1)])
     c_uso = next((c for c in df.columns if "uso" in c.lower()), None)
@@ -842,12 +937,17 @@ def procesar_exogena(b: bytes, anio_ref: int) -> Tuple[pd.DataFrame, Dict[str, A
             if f"tope {n_t}" in kt:
                 topes_ofi[n_t] = vt
 
-    res = {
+    res: Dict[str, Any] = {
         "nombre": nom_m, "nit": nit_m, "anio": anio_m, "efectivo": 0.0, "cdt_saldo": 0.0, "inmuebles": 0.0,
         "deudas": 0.0, "consignaciones": 0.0, "tc": 0.0, "compras": 0.0, "fe_1pct": 0.0,
         "ing_trab": 0.0, "ing_hon": 0.0, "ing_nolab": 0.0, "salud_pen": 0.0, "ing_cap": 0.0,
         "inc_cap": 0.0, "retenciones": 0.0, "vivienda": 0.0, "prepagada": 0.0, "gmf": 0.0,
+        "por_entidad": {},
     }
+
+    def _sum_ent(ent_k: str, campo_k: str, v_k: float) -> None:
+        res["por_entidad"].setdefault(ent_k, {})
+        res["por_entidad"][ent_k][campo_k] = res["por_entidad"][ent_k].get(campo_k, 0.0) + v_k
 
     por_nit = {}
     for _, row in df_ter.iterrows():
@@ -855,6 +955,8 @@ def procesar_exogena(b: bytes, anio_ref: int) -> Tuple[pd.DataFrame, Dict[str, A
         if val == 0:
             continue
         nit_r = str(row.get(c_nit_r, "") or "").strip().split(".")[0]
+        nom_r = str(row.get(c_nom_r, "") or "").strip()
+        ent_norm = normalizar_entidad(f"{nit_r} {nom_r}")
         dn = str(row.get(c_det, "") or "").lower().replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
         un = (str(row.get(c_uso, "") or "").lower() if c_uso else "").replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
 
@@ -869,18 +971,23 @@ def procesar_exogena(b: bytes, anio_ref: int) -> Tuple[pd.DataFrame, Dict[str, A
         elif "tope 2" in un or "r29" in un or "saldo cuentas" in dn or "saldo cdt" in dn:
             if val < 0 or ("r30" in un and "r29" not in un) or "deuda" in dn or "pasivo" in dn:
                 res["deudas"] += abs(val)
+                _sum_ent(ent_norm, "deudas", abs(val))
             elif any(k in dn for k in ["cdt", "inversion", "accion", "fiducia", "fondo"]):
                 res["cdt_saldo"] += val
+                _sum_ent(ent_norm, "otros_activos", val)
             elif any(k in dn for k in ["inmueble", "predial", "avaluo", "vehiculo"]):
                 res["inmuebles"] += val
             else:
                 res["efectivo"] += val
+                _sum_ent(ent_norm, "efectivo", val)
         elif "r132" in un or "retencion" in dn:
             res["retenciones"] += val
-        elif "r58" in un or "cdt rendimientos" in dn or "rendimientos financieros" in dn:
+            _sum_ent(ent_norm, "retenciones_anio", val)
+        elif ("r58" in un or "cdt rendimientos" in dn or "rendimientos financieros" in dn or "intereses pagados" in dn) and "retencion" not in dn:
             res["ing_cap"] += val
+            _sum_ent(ent_norm, "ing_brutos_capital", val)
         elif "documentos soporte" in dn or "facturas electronicas de venta" in dn:
-            por_nit.setdefault(nit_r, {"t": 0.0, "h": 0.0, "n": 0.0, "ds": 0.0})
+            por_nit.setdefault(nit_r, {"ent": ent_norm, "t": 0.0, "h": 0.0, "n": 0.0, "ds": 0.0})
             por_nit[nit_r]["ds"] += (-val if (dn.startswith("ajuste") or "descuenta automaticamente" in un) else val)
         elif "r33" in un or "r44" in un or "salud obligatoria" in dn or "pension obligatoria" in dn:
             res["salud_pen"] += val
@@ -891,21 +998,26 @@ def procesar_exogena(b: bytes, anio_ref: int) -> Tuple[pd.DataFrame, Dict[str, A
         elif "gmf" in dn or "4x1000" in dn:
             res["gmf"] += val
         elif "r32" in un or "salarios" in dn or "pagos laborales" in dn:
-            por_nit.setdefault(nit_r, {"t": 0.0, "h": 0.0, "n": 0.0, "ds": 0.0})
+            por_nit.setdefault(nit_r, {"ent": ent_norm, "t": 0.0, "h": 0.0, "n": 0.0, "ds": 0.0})
             por_nit[nit_r]["t"] += val
         elif "r43" in un or "honorarios" in dn or "servicios" in dn:
-            por_nit.setdefault(nit_r, {"t": 0.0, "h": 0.0, "n": 0.0, "ds": 0.0})
+            por_nit.setdefault(nit_r, {"ent": ent_norm, "t": 0.0, "h": 0.0, "n": 0.0, "ds": 0.0})
             por_nit[nit_r]["h"] += val
         elif "r74" in un or "tope 1" in un:
-            por_nit.setdefault(nit_r, {"t": 0.0, "h": 0.0, "n": 0.0, "ds": 0.0})
+            por_nit.setdefault(nit_r, {"ent": ent_norm, "t": 0.0, "h": 0.0, "n": 0.0, "ds": 0.0})
             por_nit[nit_r]["n"] += val
 
     for dn_v in por_nit.values():
         exo_s = dn_v["t"] + dn_v["h"] + dn_v["n"]
         ds_n = max(0.0, dn_v["ds"])
+        hon_fin = dn_v["h"] + (max(0.0, ds_n - exo_s) if ds_n > exo_s else 0.0)
         res["ing_trab"] += dn_v["t"]
-        res["ing_hon"] += dn_v["h"] + (max(0.0, ds_n - exo_s) if ds_n > exo_s else 0.0)
+        res["ing_hon"] += hon_fin
         res["ing_nolab"] += dn_v["n"]
+        if dn_v["t"] > 0:
+            _sum_ent(dn_v["ent"], "ing_brutos_trabajo", dn_v["t"])
+        if hon_fin > 0:
+            _sum_ent(dn_v["ent"], "ing_brutos_honorarios", hon_fin)
 
     if topes_ofi.get("4", 0) > 0:
         res["consignaciones"] = topes_ofi["4"]
@@ -1033,13 +1145,15 @@ def generar_word(r: dict, d: dict, anio: int, uvt: float) -> bytes:
 
 
 # ==============================================================================
-# 6. INTERFAZ PRINCIPAL BLINDADA (v5.5 FUSIÓN PRO)
+# 6. INTERFAZ PRINCIPAL BLINDADA (v5.6 FUSIÓN PRO — ANTI-DUPLICADOS)
 # ==============================================================================
 if not verificar_acceso():
     st.stop()
 
 if "datos" not in st.session_state:
     st.session_state.datos = datos_vacios()
+elif "auto_comp_inflacionario" not in st.session_state.datos:
+    st.session_state.datos["auto_comp_inflacionario"] = True
 if "anio_activo" not in st.session_state:
     st.session_state.anio_activo = datetime.date.today().year - 1
 if "uvt_map" not in st.session_state:
@@ -1054,6 +1168,8 @@ if "mem_pila" not in st.session_state:
     st.session_state.mem_pila = {}
 if "mem_cert" not in st.session_state:
     st.session_state.mem_cert = []
+if "avisos_cert" not in st.session_state:
+    st.session_state.avisos_cert = []
 if "auditoria_ia" not in st.session_state:
     st.session_state.auditoria_ia = ""
 if "chat" not in st.session_state:
@@ -1067,7 +1183,7 @@ d = st.session_state.datos
 
 with st.sidebar:
     st.title("⚙️ Configuración DIAN")
-    st.caption("Versión **v5.5 Fusión Pro** • Gemini 3.x + Caché SHA-256 + MUISCA Exacto")
+    st.caption("Versión **v5.6 Fusión Pro** • Anti-Duplicados + Conciliación Exógena")
 
     sec_key = obtener_secreto("GEMINI_API_KEY")
     if sec_key:
@@ -1148,6 +1264,7 @@ with st.sidebar:
             st.session_state.mem_exo = None
             st.session_state.mem_pila = {}
             st.session_state.mem_cert = []
+            st.session_state.avisos_cert = []
             st.session_state.auditoria_ia = ""
             st.session_state.chat = []
             st.session_state.form_id += 1
@@ -1175,7 +1292,7 @@ t1, t2, t3, t4, t5 = st.tabs([
 ])
 
 # ==============================================================================
-# PASO 1: EXÓGENA PERSISTENTE + PILA PERSISTENTE + SOPORTES CON CACHÉ SHA-256
+# PASO 1: EXÓGENA PERSISTENTE + PILA PERSISTENTE + SOPORTES CON CONCILIACIÓN
 # ==============================================================================
 with t1:
     c_izq, c_der = st.columns(2)
@@ -1232,6 +1349,7 @@ with t1:
                     d["salud_pension_trabajo"] = rs_e["salud_pen"]
                 d["ing_brutos_capital"] = rs_e["ing_cap"]
                 d["incrngo_capital"] = rs_e["inc_cap"]
+                d["auto_comp_inflacionario"] = True
                 d["retenciones_anio"] = rs_e["retenciones"]
                 if rs_e["vivienda"] > 0:
                     d["intereses_vivienda"] = rs_e["vivienda"]
@@ -1311,7 +1429,7 @@ with t1:
         st.divider()
         st.subheader("📄 C. Lector de Otros Certificados (220, CDT, Predial, Salud)")
         f_certs = st.file_uploader(
-            "Sube PDFs o fotos de certificados",
+            "Sube PDFs o fotos de certificados (filtra duplicados entre Retefuente y Saldo del mismo banco)",
             type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True, key=f"cert_{rid}",
         )
         if f_certs:
@@ -1330,9 +1448,7 @@ with t1:
                         if h_sha not in resultados:
                             pendientes.append((arc, cont, h_sha))
 
-                    if not pendientes:
-                        st.info("✅ Estos certificados ya están extraídos en memoria (0 consultas nuevas a Gemini).")
-                    else:
+                    if pendientes:
                         try:
                             with st.spinner(f"Procesando {len(pendientes)} soporte(s) nuevo(s) en 1 sola llamada IA..."):
                                 lista_nuevos = extraer_pendientes_con_ia(api_key, pendientes)
@@ -1351,7 +1467,10 @@ with t1:
                                 item_loc["_sha256"] = h_sha
                                 resultados[h_sha] = item_loc
 
-                        st.session_state.mem_cert = sin_huella + list(resultados.values())
+                    lote_bruto = sin_huella + list(resultados.values())
+                    limpios, avisos = deduplicar_certificados_lote(lote_bruto)
+                    st.session_state.mem_cert = limpios
+                    st.session_state.avisos_cert = avisos
 
             if bt_nat.button(f"⚡ Extraer {len(f_certs)} SIN IA (Local)", use_container_width=True):
                 with st.spinner("Extrayendo cifras localmente (PDF + OCR)..."):
@@ -1361,13 +1480,21 @@ with t1:
                         it_l = extraer_soporte_nativo_sin_ia(arc.name, cont, arc.type)
                         it_l["_sha256"] = hashlib.sha256(cont).hexdigest()
                         nuevos_loc.append(it_l)
-                    st.session_state.mem_cert = nuevos_loc
+                    limpios, avisos = deduplicar_certificados_lote(nuevos_loc)
+                    st.session_state.mem_cert = limpios
+                    st.session_state.avisos_cert = avisos
+
+        for av in st.session_state.avisos_cert:
+            st.info(f"🛡️ {av}")
 
         if st.session_state.mem_cert:
-            st.caption("Tabla editable de certificados extraídos (puedes corregir cualquier celda antes de aplicar):")
+            st.caption("Verifica las cifras extraídas (desmarca 'incluir' si algún soporte ya está contado en otro documento):")
             df_base = pd.DataFrame(st.session_state.mem_cert).drop(columns=["_sha256"], errors="ignore")
+            if "incluir" not in df_base.columns:
+                df_base.insert(0, "incluir", True)
             df_c = st.data_editor(df_base, use_container_width=True, hide_index=True, num_rows="dynamic")
-            cc1, cc2 = st.columns(2)
+            df_act = df_c[df_c["incluir"].fillna(True).astype(bool)].copy()
+
             mapeo_campos = [
                 ("efectivo_bancos_dic31", "efectivo"),
                 ("valor_inmueble_o_cdt_dic31", "otros_activos"),
@@ -1384,22 +1511,83 @@ with t1:
                 ("aportes_afc_fpv", "aportes_afc_fpv"),
                 ("retenciones_practicadas", "retenciones_anio"),
             ]
-            if cc1.button("🔄 Reemplazar casillas con estos certificados", type="primary", use_container_width=True):
-                for campo_df, campo_d in mapeo_campos:
-                    if campo_df in df_c.columns:
-                        suma_segura = float(df_c[campo_df].apply(_nvl).sum())
-                        if suma_segura > 0:
-                            d[campo_d] = suma_segura
+
+            pct_inf_act = COMP_INFLACIONARIO.get(anio_gravable, 0.5544)
+            cc0, cc1, cc2 = st.columns(3)
+
+            if cc0.button("🧠 Conciliar con Exógena (Sin Duplicar)", type="primary", use_container_width=True):
+                exo_ent = (st.session_state.mem_exo or {}).get("res", {}).get("por_entidad", {})
+                campos_por_entidad = {
+                    "efectivo_bancos_dic31": "efectivo",
+                    "valor_inmueble_o_cdt_dic31": "otros_activos",
+                    "saldo_deuda_dic31": "deudas",
+                    "ingresos_brutos_trabajo": "ing_brutos_trabajo",
+                    "ingresos_brutos_honorarios": "ing_brutos_honorarios",
+                    "ingresos_capital_cdt": "ing_brutos_capital",
+                    "retenciones_practicadas": "retenciones_anio",
+                }
+                if exo_ent:
+                    cert_por_ent: Dict[str, Dict[str, float]] = {}
+                    for _, fila_c in df_act.iterrows():
+                        ent_c = normalizar_entidad(str(fila_c.get("entidad", "")))
+                        cert_por_ent.setdefault(ent_c, {})
+                        for col_df, col_d in campos_por_entidad.items():
+                            if col_df in df_act.columns:
+                                cert_por_ent[ent_c][col_d] = cert_por_ent[ent_c].get(col_d, 0.0) + _nvl(fila_c.get(col_df, 0))
+
+                    todas_ents = set(exo_ent.keys()) | set(cert_por_ent.keys())
+                    for col_d in campos_por_entidad.values():
+                        tot_conciliado = sum(
+                            max(exo_ent.get(e_k, {}).get(col_d, 0.0), cert_por_ent.get(e_k, {}).get(col_d, 0.0))
+                            for e_k in todas_ents
+                        )
+                        if tot_conciliado > 0:
+                            d[col_d] = tot_conciliado
+
+                    for col_df, col_d in mapeo_campos:
+                        if col_df not in campos_por_entidad and col_df in df_act.columns:
+                            v_extra = float(df_act[col_df].apply(_nvl).sum())
+                            if v_extra > 0:
+                                d[col_d] = max(d[col_d], v_extra)
+                else:
+                    for campo_df, campo_d in mapeo_campos:
+                        if campo_df in df_act.columns:
+                            suma_segura = float(df_act[campo_df].apply(_nvl).sum())
+                            if suma_segura > 0:
+                                d[campo_d] = suma_segura
+
+                if d["ing_brutos_capital"] > 0 and d.get("auto_comp_inflacionario", True):
+                    d["incrngo_capital"] = float(redondear_dian(d["ing_brutos_capital"] * pct_inf_act))
+
                 st.session_state.mem_cert = []
-                st.session_state.toast_ok = "✅ Casillas actualizadas con tus certificados."
+                st.session_state.avisos_cert = []
+                st.session_state.toast_ok = "✅ Soportes conciliados por entidad sin duplicar valores de Exógena."
                 st.session_state.form_id += 1
                 st.rerun()
-            if cc2.button("➕ Sumar a los valores actuales", use_container_width=True):
+
+            if cc1.button("🔄 Solo Reemplazar con Certificados", use_container_width=True):
                 for campo_df, campo_d in mapeo_campos:
-                    if campo_df in df_c.columns:
-                        d[campo_d] += float(df_c[campo_df].apply(_nvl).sum())
+                    if campo_df in df_act.columns:
+                        suma_segura = float(df_act[campo_df].apply(_nvl).sum())
+                        if suma_segura > 0:
+                            d[campo_d] = suma_segura
+                if d["ing_brutos_capital"] > 0 and (d.get("auto_comp_inflacionario", True) or _nvl(df_act.get("componente_inflacionario_cdt", pd.Series([0])).sum()) == 0):
+                    d["incrngo_capital"] = float(redondear_dian(d["ing_brutos_capital"] * pct_inf_act))
                 st.session_state.mem_cert = []
-                st.session_state.toast_ok = "✅ Certificados sumados correctamente."
+                st.session_state.avisos_cert = []
+                st.session_state.toast_ok = "✅ Casillas actualizadas únicamente con los certificados seleccionados."
+                st.session_state.form_id += 1
+                st.rerun()
+
+            if cc2.button("➕ Sumar Manualmente", use_container_width=True):
+                for campo_df, campo_d in mapeo_campos:
+                    if campo_df in df_act.columns:
+                        d[campo_d] += float(df_act[campo_df].apply(_nvl).sum())
+                if d["ing_brutos_capital"] > 0 and d.get("auto_comp_inflacionario", True):
+                    d["incrngo_capital"] = float(redondear_dian(d["ing_brutos_capital"] * pct_inf_act))
+                st.session_state.mem_cert = []
+                st.session_state.avisos_cert = []
+                st.session_state.toast_ok = "✅ Certificados sumados y componente inflacionario sincronizado."
                 st.session_state.form_id += 1
                 st.rerun()
 
@@ -1466,13 +1654,18 @@ with t3:
     with g2:
         st.subheader("🏦 3. Rentas de Capital: CDTs, Intereses y Arriendos")
         d["ing_brutos_capital"] = st.number_input("Intereses CDT o ingresos por arriendos (Casilla 58)", min_value=0.0, value=float(d["ing_brutos_capital"]), step=50_000.0, key=f"ic_{fid}")
-        d["incrngo_capital"] = st.number_input("Componente Inflacionario no gravado CDT (Casilla 59)", min_value=0.0, value=float(d["incrngo_capital"]), step=50_000.0, key=f"inc_{fid}")
-        if d["ing_brutos_capital"] > 0:
-            pct_i = COMP_INFLACIONARIO.get(anio_gravable, 0.5544)
-            if st.button(f"✨ Calcular Componente Inflacionario ({pct_i*100:.2f}%)", use_container_width=True):
-                d["incrngo_capital"] = float(redondear_dian(d["ing_brutos_capital"] * pct_i))
-                st.session_state.form_id += 1
-                st.rerun()
+        pct_i = COMP_INFLACIONARIO.get(anio_gravable, 0.5544)
+        d["auto_comp_inflacionario"] = st.toggle(
+            f"🔄 Sincronizar automáticamente Componente Inflacionario ({pct_i*100:.2f}%) sobre CDT/Intereses",
+            value=bool(d.get("auto_comp_inflacionario", True)),
+            help="Desactívalo únicamente si en Casilla 58 incluiste ingresos por arrendamientos o certificados mixtos.",
+            key=f"aci_{fid}",
+        )
+        if d["auto_comp_inflacionario"] and d["ing_brutos_capital"] > 0 and d["costos_capital"] == 0:
+            d["incrngo_capital"] = float(redondear_dian(d["ing_brutos_capital"] * pct_i))
+            st.caption(f"✅ Casilla 59 sincronizada automáticamente al {pct_i*100:.2f}%: **${d['incrngo_capital']:,.0f}**")
+        else:
+            d["incrngo_capital"] = st.number_input("Componente Inflacionario no gravado CDT manual (Casilla 59)", min_value=0.0, value=float(d["incrngo_capital"]), step=50_000.0, key=f"inc_{fid}")
         d["costos_capital"] = st.number_input("Gastos procedentes de arriendos (Casilla 60)", min_value=0.0, value=float(d["costos_capital"]), step=50_000.0, key=f"cc_{fid}")
 
         st.divider()
@@ -1516,7 +1709,7 @@ with t4:
         d["aplica_reduccion_640"] = st.checkbox("Reducir sanción al 50% (Art. 640 E.T.)", value=bool(d["aplica_reduccion_640"]), key=f"r6_{fid}")
 
 # CÁLCULO FINAL EN VIVO PARA TODA LA APP
-r = liquidar_210(d, valor_uvt, uvt_pat, uvt_ing, uvt_san)
+r = liquidar_210(d, valor_uvt, uvt_pat, uvt_ing, uvt_san, anio_grav=anio_gravable)
 
 with slot_bolsa:
     pct_b = min(1.0, (r["usado_40"] / r["lim_40"]) if r["lim_40"] > 0 else 0.0)
@@ -1599,8 +1792,9 @@ with t5:
                             f"Eres Contador Tributarista Senior experto en DIAN Colombia. "
                             f"AG {anio_gravable}, UVT ${valor_uvt:,.0f}. Recuerda que según Concepto Unificado DIAN "
                             f"0912 de 2018 (Descriptor 1.12) y Arts. 55-56 E.T., EPS + Pensión + ARL pagados por el "
-                            f"independiente van como Ingreso No Constitutivo de Renta (Casilla 33 o 44). "
-                            f"Liquidación actual del contribuyente: {json.dumps(r, ensure_ascii=False)}."
+                            f"independiente van como Ingreso No Constitutivo de Renta (Casilla 33 o 44), y los "
+                            f"rendimientos financieros tienen componente inflacionario no gravado del {COMP_INFLACIONARIO.get(anio_gravable, 0.5544)*100:.2f}% "
+                            f"(Casilla 59). Liquidación actual: {json.dumps(r, ensure_ascii=False)}."
                         )
                         historial = [
                             types.Content(
