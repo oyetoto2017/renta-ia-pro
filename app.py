@@ -57,6 +57,23 @@ ACTIVIDADES_CIIU = [
     "OTRO - Digitar otro código CIIU",
 ]
 
+# PARÁMETRO CORREGIDO: Límites Ley 2277 que faltaban en la versión anterior
+LIMITES_LEY_2277 = {
+    "pct_bolsa_global": 0.40,
+    "tope_bolsa_uvt": 1_340,
+    "exenta_25_uvt": 790,
+    "vivienda_uvt": 1_200,
+    "prepagada_mes_uvt": 16,
+    "dep_10pct_mes_uvt": 32,
+    "dep_extra_uvt": 72,
+    "max_dep_extra": 4,
+    "icetex_uvt": 100,
+    "factura_elec_pct": 0.01,
+    "factura_elec_uvt": 240,
+    "afc_fpv_uvt": 3_800,
+    "pensiones_exentas_uvt": 12_000,
+}
+
 TABLA_ART_241 = [
     (0, 1_090, 0.00, 0),
     (1_090, 1_700, 0.19, 0),
@@ -144,7 +161,7 @@ def verificar_acceso() -> bool:
 
 
 def obtener_cliente_exacto(llave: str):
-    """Enruta cada clave a su servidor exacto y evita choque de clientes."""
+    """Evita fallos al detectar automáticamente si es clave temporal (AQ.) o fija (AIza)."""
     if llave.startswith("AQ."):
         return genai.Client(vertexai=True, api_key=llave)
     return genai.Client(api_key=llave)
@@ -169,7 +186,6 @@ def llamar_gemini(
     ultimo_err = None
     errores_modelos = []
     
-    # Intenta primero con 2.5 Flash, si falla cuota, intenta 2.5 Flash Lite
     for mod in ["gemini-2.5-flash", "gemini-2.5-flash-lite"]:
         for intento in range(3):
             try:
@@ -223,7 +239,7 @@ def llamar_gemini(
     if "401" in resumen_err or "403" in resumen_err or "404" in resumen_err:
         if llave.startswith("AQ."):
             raise RuntimeError(
-                f"La clave temporal 'AQ.' no tiene permisos en Vertex AI o caducó. "
+                f"La clave temporal 'AQ.' caducó o no tiene permisos de Vertex AI. "
                 "Crea una clave gratuita 'AIzaSy...' en aistudio.google.com/apikey y guárdala en Secrets."
             )
     raise RuntimeError(f"No se pudo completar la consulta a Gemini. Detalle técnico: {resumen_err}")
@@ -284,12 +300,11 @@ def liquidar_210(d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, 
     c77 = min(neto_nl, redondear_dian(d["costos_no_laborales"]))
     c78 = max(0, neto_nl - c77)
 
-    # 3. RENTAS DE TRABAJO Y HONORARIOS (Concepto Unificado DIAN 0912/2018 -> ARL es INCRNGO C.33/C.44)
-    # INCRNGO Total = Salud Salarios + Salud/Pensión Honorarios + ARL Honorarios
+    # 3. RENTAS DE TRABAJO Y HONORARIOS (Concepto Unificado DIAN 0912/2018 -> ARL es INCRNGO Casilla 33/44)
     incrngo_trab_tot_pesos = d["salud_pension_trabajo"] + d["salud_pension_honorarios"] + d["arl_honorarios"]
-    
     trab_bruto_tot = redondear_dian(d["ing_brutos_trabajo"]) + redondear_dian(d["ing_brutos_honorarios"])
     inc_trab_tot = min(trab_bruto_tot, redondear_dian(incrngo_trab_tot_pesos))
+    
     ing_brutos_cg = trab_bruto_tot + c58 + c74
     ing_netos_cg = max(0, trab_bruto_tot - inc_trab_tot) + neto_cap + neto_nl
     hay_trab = trab_bruto_tot > 0
@@ -318,14 +333,13 @@ def liquidar_210(d: Dict[str, Any], uvt: float, uvt_pat: float, uvt_ing: float, 
     aceptados_40_a = min(solicitados_a, lim_40, c91_a)
     rem_a = max(0, c91_a - aceptados_40_a)
 
-    # Ruta B: Honorarios en C.43 (Con costos C.45, renunciando al 25% sobre honorarios)
+    # Ruta B: Honorarios en C.43 (Con costos C.45)
     cost_hon = redondear_dian(d["costos_honorarios"])
     c32_b = redondear_dian(d["ing_brutos_trabajo"])
     c33_b = min(c32_b, redondear_dian(d["salud_pension_trabajo"]))
     c34_b = max(0, c32_b - c33_b)
     
     c43_b = redondear_dian(d["ing_brutos_honorarios"])
-    # INCRNGO Honorarios (Salud/Pension PILA + ARL + posible remanente de salud salarios si fue mayor al salario)
     pila_hon = redondear_dian(d["salud_pension_honorarios"] + d["arl_honorarios"]) + max(0, redondear_dian(d["salud_pension_trabajo"]) - c33_b)
     c44_b = min(c43_b, pila_hon)
     neto_h_b = max(0, c43_b - c44_b)
@@ -811,11 +825,11 @@ def procesar_exogena(b: bytes, anio_ref: int) -> Tuple[pd.DataFrame, Dict[str, A
                 res["deudas"] += abs(val)
             elif any(k in dn for k in ["cdt", "inversion", "accion", "fiducia", "fondo"]):
                 res["cdt_saldo"] += val
-            elif any(k in dn for k in ["inmueble", "predial", "avaluo", "vehiculo", "automotor"]):
+            elif any(k in dn for k in ["inmueble", "predial", "avaluo", "vehiculo"]):
                 res["inmuebles"] += val
             else:
                 res["efectivo"] += val
-        elif "r132" in un or "retencion" in dn or "valor retenido" in dn:
+        elif "r132" in un or "retencion" in dn:
             res["retenciones"] += val
         elif "r58" in un or "cdt rendimientos" in dn or "rendimientos financieros" in dn:
             res["ing_cap"] += val
@@ -1001,7 +1015,7 @@ d = st.session_state.datos
 
 with st.sidebar:
     st.title("⚙️ Configuración DIAN")
-    st.caption("Versión **v5.5 Oficial DIAN** • ARL Casilla 33 Activa")
+    st.caption("Versión **v5.6 Definitiva** • ARL Casilla 33 Activa")
 
     sec_key = obtener_secreto("GEMINI_API_KEY")
     if sec_key:
@@ -1168,7 +1182,7 @@ with t1:
                         st.error(f"⚠️ {e}")
 
         if st.session_state.auditoria_ia:
-            st.info(st.session_state.auditoria_ia)
+            st.success(st.session_state.auditoria_ia)
 
     with c_der:
         st.subheader("🏥 B. Lector Masivo de Planillas PILA (Multi-PDF sin IA)")
@@ -1299,7 +1313,7 @@ with t1:
 # PASO 2: PERFIL DIAN, PATRIMONIO Y DEUDAS
 # ==============================================================================
 with t2:
-    i1, i2, i3, i4 = st.columns([2.2, 1.2, 1.3, 1.8])
+    i1, i2, i3, i4 = st.columns([2.2, 1.3, 1.3, 1.8])
     d["nombre_declarante"] = i1.text_input("Nombre Completo (Casillas 7-10)", value=d["nombre_declarante"], key=f"nm_{fid}")
     d["nit_declarante"] = i2.text_input("Cédula / NIT sin DV (Casilla 5)", value=d["nit_declarante"], key=f"nt_{fid}")
     i2.caption(f"DV automático (Casilla 6): **{calcular_dv(d['nit_declarante']) or '-'}**")
@@ -1308,13 +1322,29 @@ with t2:
     sel_c = i4.selectbox("Actividad Económica CIIU (Casilla 24)", ACTIVIDADES_CIIU, index=cods_c.index(d["cod_actividad"]) if d["cod_actividad"] in cods_c else len(ACTIVIDADES_CIIU) - 1, key=f"ci_{fid}")
     d["cod_actividad"] = i4.text_input("Código CIIU manual", value=d["cod_actividad"], key=f"cm_{fid}") if sel_c.startswith("OTRO") else sel_c.split(" - ")[0]
 
+    info_venc = orientacion_vencimiento_dian(d["nit_declarante"], anio_gravable + 1)
+    if info_venc:
+        st.caption(f"🗓️ {info_venc} — Verifica el día exacto en el calendario tributario oficial de la DIAN.")
+
     st.divider()
     p1, p2 = st.columns(2)
     with p1:
         st.subheader(f"Patrimonio y Deudas a 31 de Diciembre de {anio_gravable}")
         d["efectivo"] = st.number_input("🏦 Saldos en cuentas bancarias, Nequi, Daviplata y efectivo", min_value=0.0, value=float(d["efectivo"]), step=100_000.0, key=f"ef_{fid}")
         d["otros_activos"] = st.number_input("📈 CDTs vigentes a dic 31, fiducias, acciones y cuentas por cobrar", min_value=0.0, value=float(d["otros_activos"]), step=200_000.0, key=f"oa_{fid}")
-        d["inmuebles"] = st.number_input("🏠 Bienes Raíces: Casas, lotes, apartamentos (Mayor entre escritura y predial)", min_value=0.0, value=float(d["inmuebles"]), step=1_000_000.0, key=f"in_{fid}")
+        
+        with st.expander("🏡 Asistente DIAN para Inmuebles: Comparar Compra vs. Predial (Art. 277 E.T.)"):
+            st.caption("La DIAN exige declarar cada inmueble por el **mayor valor** entre el precio de compra (escritura) y el avalúo catastral del recibo Predial.")
+            ca1, ca2 = st.columns(2)
+            costo_esc = ca1.number_input("Precio de compra / Costo fiscal ($)", min_value=0.0, step=1_000_000.0, key=f"esc_{fid}")
+            avaluo_pred = ca2.number_input("Avalúo Catastral recibo Predial ($)", min_value=0.0, step=1_000_000.0, key=f"pred_{fid}")
+            mayor_inm = max(costo_esc, avaluo_pred)
+            if mayor_inm > 0 and st.button(f"➕ Sumar mayor valor oficial (${mayor_inm:,.0f}) a Bienes Raíces", use_container_width=True):
+                d["inmuebles"] += float(mayor_inm)
+                st.session_state.form_id += 1
+                st.rerun()
+
+        d["inmuebles"] = st.number_input("🏠 Total Bienes Raíces: Casas, lotes, apartamentos (Mayor entre escritura y predial)", min_value=0.0, value=float(d["inmuebles"]), step=1_000_000.0, key=f"in_{fid}")
         d["vehiculos"] = st.number_input("🚗 Vehículos, motos y otros bienes (Precio de compra)", min_value=0.0, value=float(d["vehiculos"]), step=500_000.0, key=f"vh_{fid}")
         d["deudas"] = st.number_input("💳 Total Deudas vigentes a dic 31 (Hipotecas, bancos, tarjetas — Casilla 30)", min_value=0.0, value=float(d["deudas"]), step=200_000.0, key=f"de_{fid}")
     with p2:
@@ -1323,6 +1353,20 @@ with t2:
         d["tarjetas_credito"] = st.number_input("Consumos con Tarjeta de Crédito (Tope 3)", min_value=0.0, value=float(d["tarjetas_credito"]), step=500_000.0, key=f"tc_{fid}")
         d["compras_totales"] = st.number_input("Compras y consumos totales del año (Tope 5)", min_value=0.0, value=float(d["compras_totales"]), step=500_000.0, key=f"cp_{fid}")
         d["responsable_iva"] = st.toggle("¿Responsable de IVA a 31 de diciembre?", value=bool(d["responsable_iva"]), key=f"iv_{fid}")
+        
+        res_parcial = liquidar_210(d, valor_uvt, uvt_pat, uvt_ing, uvt_san)
+        st.markdown("**Progreso frente a los Topes DIAN para estar obligado a declarar:**")
+        for nombre_t, actual_t, limite_t in [
+            ("Patrimonio Bruto", res_parcial["c29"], res_parcial["t_pat"]),
+            ("Ingresos Brutos", res_parcial["ing_tot"], res_parcial["t_ing"]),
+            ("Consignaciones / Inversiones", d["consignaciones"], res_parcial["t_ing"]),
+            ("Compras / Tarjetas", max(d["compras_totales"], d["tarjetas_credito"]), res_parcial["t_ing"]),
+        ]:
+            pct_t = min(1.0, (actual_t / limite_t) if limite_t > 0 else 0.0)
+            icono_t = "🔴 Supera tope" if actual_t >= limite_t else "🟢 Bajo el tope"
+            st.progress(pct_t, text=f"{icono_t} — {nombre_t}: ${actual_t:,.0f} / Tope: ${limite_t:,.0f}")
+            
+        st.divider()
         d["patrimonio_liquido_anterior"] = st.number_input("Patrimonio Líquido declaración año anterior (Opcional — Art. 236)", min_value=0.0, value=float(d["patrimonio_liquido_anterior"]), step=500_000.0, key=f"pa_{fid}")
 
 # ==============================================================================
@@ -1343,6 +1387,15 @@ with t3:
         ca1, ca2 = st.columns(2)
         d["arl_honorarios"] = ca1.number_input("ARL Riesgos Laborales", min_value=0.0, value=float(d["arl_honorarios"]), step=10_000.0, key=f"arl_{fid}")
         d["costos_honorarios"] = ca2.number_input("Otros costos con factura", min_value=0.0, value=float(d["costos_honorarios"]), step=100_000.0, key=f"ch_{fid}")
+
+        if d["ing_brutos_honorarios"] > 0:
+            res_parcial_p3 = liquidar_210(d, valor_uvt, uvt_pat, uvt_ing, uvt_san)
+            st.info(
+                f"🤖 **Comparador Automático DIAN:**\n"
+                f"- Base gravable usando **25% Renta Exenta (Casilla 32)**: `${res_parcial_p3['rem_25']:,.0f}`\n"
+                f"- Base gravable usando **Costos + ARL (Casillas 43-46)**: `${res_parcial_p3['rem_costos']:,.0f}`\n"
+                f"👉 El sistema aplicó automáticamente: **{res_parcial_p3['estrategia']}**"
+            )
 
     with g2:
         st.subheader("🏦 3. Rentas de Capital: CDTs, Intereses y Arriendos")
