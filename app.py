@@ -49,7 +49,7 @@ st.set_page_config(
 # 1. PARÁMETROS NORMATIVOS DIAN MULTIAÑO (FUNCIONA PARA CUALQUIER AÑO FUTURO)
 # ==============================================================================
 UVT_OFICIAL = {2022: 38_004, 2023: 42_412, 2024: 47_065, 2025: 49_799, 2026: 52_374}
-COMP_INFLACIONARIO = {2023: 0.6671, 2024: 0.5088, 2025: 0.5544, 2026: 0.5544}
+COMP_INFLACIONARIO = {2023: 0.6671, 2024: 0.5088, 2025: 0.5543, 2026: 0.5544}
 
 SECCIONALES_DIAN = [
     "32 - Bogotá D.C.", "11 - Medellín", "05 - Cali", "02 - Barranquilla", "04 - Bucaramanga",
